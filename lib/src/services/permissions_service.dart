@@ -24,12 +24,22 @@ class PermissionsService {
   final NativePackageService _nativePackageService;
 
   Future<List<PermissionStatusCard>> loadStatuses(AppStrings tr) async {
+    // Device info is needed first to know which storage/media permission to
+    // query. Everything else is queried in parallel — each Permission.status
+    // call is a MethodChannel hop, so serial awaits add up to ~100 ms.
     final device = await _nativePackageService.getDeviceInfo();
-    final notifications = await Permission.notification.status;
-    final fileManager = await _storagePermission(device.sdkInt).status;
-    final mediaPermission = await _mediaPermission(device.sdkInt).status;
-    final battery = await Permission.ignoreBatteryOptimizations.status;
-    final installPackages = await Permission.requestInstallPackages.status;
+    final results = await Future.wait<PermissionStatus>([
+      Permission.notification.status,
+      _storagePermission(device.sdkInt).status,
+      _mediaPermission(device.sdkInt).status,
+      Permission.ignoreBatteryOptimizations.status,
+      Permission.requestInstallPackages.status,
+    ]);
+    final notifications = results[0];
+    final fileManager = results[1];
+    final mediaPermission = results[2];
+    final battery = results[3];
+    final installPackages = results[4];
 
     return [
       PermissionStatusCard(

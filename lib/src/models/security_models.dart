@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
@@ -123,6 +124,7 @@ class ScanFinding {
     required this.details,
     this.reasons = const <String>[],
     this.location,
+    this.scannedAt,
   });
 
   final String name;
@@ -131,6 +133,72 @@ class ScanFinding {
   final String details;
   final List<String> reasons;
   final String? location;
+  final DateTime? scannedAt;
+
+  Map<String, dynamic> toJson() => {
+        'name': name,
+        'type': type.name,
+        'risk': risk.name,
+        'details': details,
+        'reasons': reasons,
+        if (location != null) 'location': location,
+        'scannedAt': (scannedAt ?? DateTime.now()).toIso8601String(),
+      };
+
+  static ScanFinding fromJson(Map<String, dynamic> json) {
+    return ScanFinding(
+      name: json['name'] as String? ?? '',
+      type: ScanTargetType.values.firstWhere(
+        (e) => e.name == json['type'],
+        orElse: () => ScanTargetType.file,
+      ),
+      risk: RiskLevel.values.firstWhere(
+        (e) => e.name == json['risk'],
+        orElse: () => RiskLevel.safe,
+      ),
+      details: json['details'] as String? ?? '',
+      reasons: (json['reasons'] as List<dynamic>?)
+              ?.map((e) => e.toString())
+              .toList() ??
+          const [],
+      location: json['location'] as String?,
+      scannedAt: json['scannedAt'] != null
+          ? DateTime.tryParse(json['scannedAt'] as String)
+          : null,
+    );
+  }
+
+  static String encodeList(List<ScanFinding> findings) =>
+      jsonEncode(findings.map((f) => f.toJson()).toList());
+
+  static List<ScanFinding> decodeList(String json) {
+    try {
+      final list = jsonDecode(json) as List<dynamic>;
+      return list
+          .whereType<Map<String, dynamic>>()
+          .map(ScanFinding.fromJson)
+          .toList();
+    } catch (_) {
+      return [];
+    }
+  }
+}
+
+class SystemIntegrityResult {
+  const SystemIntegrityResult({
+    required this.isRooted,
+    required this.adbEnabled,
+    required this.testKeysBuild,
+  });
+
+  final bool isRooted;
+  final bool adbEnabled;
+  final bool testKeysBuild;
+
+  bool get hasIssue => isRooted || adbEnabled || testKeysBuild;
+
+  int get issueCount =>
+      (isRooted ? 1 : 0) + (adbEnabled ? 1 : 0) + (testKeysBuild ? 1 : 0);
 }
 
 class AppPermission {

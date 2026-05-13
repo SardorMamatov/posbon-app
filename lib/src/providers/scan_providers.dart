@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../core/app_constants.dart';
 import '../services/apk_scan_engine.dart';
 import '../services/app_scan_service.dart';
+import '../services/file_scan_io_service.dart';
 import '../services/file_scan_service.dart';
 import '../services/native_package_service.dart';
 import '../services/permission_analyzer.dart';
@@ -24,10 +25,18 @@ final virusTotalServiceProvider = Provider<VirusTotalService>((ref) {
   return service;
 });
 
+final fileScanIoServiceProvider = Provider<FileScanIoService?>((ref) {
+  if (AppConstants.fileScanIoApiKey.isEmpty) return null;
+  final service = FileScanIoService(apiKey: AppConstants.fileScanIoApiKey);
+  ref.onDispose(service.dispose);
+  return service;
+});
+
 final apkScanEngineProvider = Provider<ApkScanEngine>((ref) {
   return ApkScanEngine(
     permissionAnalyzer: ref.watch(permissionAnalyzerProvider),
     virusTotalService: ref.watch(virusTotalServiceProvider),
+    fileScanIoService: ref.watch(fileScanIoServiceProvider),
   );
 });
 

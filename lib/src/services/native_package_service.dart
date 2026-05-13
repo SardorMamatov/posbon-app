@@ -2,6 +2,8 @@ import 'dart:async';
 
 import 'package:flutter/services.dart';
 
+import '../models/security_models.dart';
+
 class NativePackageInfo {
   const NativePackageInfo({required this.packageName, required this.apkPath});
 
@@ -127,6 +129,56 @@ class NativePackageService {
     return result ?? false;
   }
 
+  Future<bool> startDownloadWatcher({
+    required String ongoingTitle,
+    required String ongoingBody,
+    required String alertTitle,
+    required String alertBody,
+    required String stopAction,
+  }) async {
+    try {
+      final result = await _channel.invokeMethod<bool>(
+        'startDownloadWatcher',
+        <String, dynamic>{
+          'ongoingTitle': ongoingTitle,
+          'ongoingBody': ongoingBody,
+          'alertTitle': alertTitle,
+          'alertBody': alertBody,
+          'stopAction': stopAction,
+        },
+      );
+      return result ?? false;
+    } on PlatformException {
+      return false;
+    } on MissingPluginException {
+      return false;
+    }
+  }
+
+  Future<bool> stopDownloadWatcher() async {
+    try {
+      final result = await _channel.invokeMethod<bool>('stopDownloadWatcher');
+      return result ?? false;
+    } on PlatformException {
+      return false;
+    } on MissingPluginException {
+      return false;
+    }
+  }
+
+  Future<bool> isDownloadWatcherRunning() async {
+    try {
+      final result = await _channel.invokeMethod<bool>(
+        'isDownloadWatcherRunning',
+      );
+      return result ?? false;
+    } on PlatformException {
+      return false;
+    } on MissingPluginException {
+      return false;
+    }
+  }
+
   Future<void> _handleNativeCalls(MethodCall call) async {
     switch (call.method) {
       case 'incomingFileReady':
@@ -155,6 +207,36 @@ class NativePackageService {
         break;
       default:
         break;
+    }
+  }
+
+  Future<SystemIntegrityResult> checkSystemIntegrity() async {
+    try {
+      final result = await _channel.invokeMapMethod<String, dynamic>(
+        'checkSystemIntegrity',
+      );
+      return SystemIntegrityResult(
+        isRooted: result?['isRooted'] as bool? ?? false,
+        adbEnabled: result?['adbEnabled'] as bool? ?? false,
+        testKeysBuild: result?['testKeysBuild'] as bool? ?? false,
+      );
+    } on PlatformException {
+      return const SystemIntegrityResult(
+        isRooted: false,
+        adbEnabled: false,
+        testKeysBuild: false,
+      );
+    }
+  }
+
+  Future<void> setScreenProtection(bool enabled) async {
+    try {
+      await _channel.invokeMethod<bool>(
+        'setScreenProtection',
+        <String, dynamic>{'enabled': enabled},
+      );
+    } on PlatformException {
+      return;
     }
   }
 

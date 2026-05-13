@@ -1,8 +1,10 @@
 package com.example.posbon_app
 
+import android.app.ActivityManager
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -184,6 +186,45 @@ class MainActivity : FlutterFragmentActivity() {
                     result.success(showNotification(title, body))
                 }
 
+                "startDownloadWatcher" -> {
+                    val ongoingTitle = call.argument<String>("ongoingTitle")
+                    val ongoingBody = call.argument<String>("ongoingBody")
+                    val alertTitle = call.argument<String>("alertTitle")
+                    val alertBody = call.argument<String>("alertBody")
+                    val stopAction = call.argument<String>("stopAction")
+                    val prefs = getSharedPreferences(
+                        DownloadWatcherService.PREFS_NAME,
+                        Context.MODE_PRIVATE,
+                    )
+                    prefs.edit().apply {
+                        putString(DownloadWatcherService.KEY_ONGOING_TITLE, ongoingTitle)
+                        putString(DownloadWatcherService.KEY_ONGOING_BODY, ongoingBody)
+                        putString(DownloadWatcherService.KEY_ALERT_TITLE, alertTitle)
+                        putString(DownloadWatcherService.KEY_ALERT_BODY, alertBody)
+                        putString(DownloadWatcherService.KEY_STOP_ACTION, stopAction)
+                        apply()
+                    }
+                    try {
+                        DownloadWatcherService.start(this)
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.error("watcher_start_failed", e.message, null)
+                    }
+                }
+
+                "stopDownloadWatcher" -> {
+                    try {
+                        DownloadWatcherService.stop(this)
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.error("watcher_stop_failed", e.message, null)
+                    }
+                }
+
+                "isDownloadWatcherRunning" -> {
+                    result.success(isServiceRunning(DownloadWatcherService::class.java))
+                }
+
                 "canAuthenticateDevice" -> {
                     result.success(canAuthenticateDevice())
                 }
@@ -191,6 +232,16 @@ class MainActivity : FlutterFragmentActivity() {
                 "authenticateDevice" -> {
                     val reason = call.argument<String>("reason") ?: "Qurilma himoyasi bilan tasdiqlang"
                     authenticateDevice(reason, result)
+                }
+
+                "checkSystemIntegrity" -> {
+                    result.success(checkSystemIntegrity())
+                }
+
+                "setScreenProtection" -> {
+                    val enabled = call.argument<Boolean>("enabled") ?: false
+                    setScreenProtection(enabled)
+                    result.success(true)
                 }
 
                 else -> result.notImplemented()
@@ -219,6 +270,12 @@ class MainActivity : FlutterFragmentActivity() {
 
     private fun resolveIncomingFile(intent: Intent?): String? {
         if (intent == null) return null
+
+        intent.getStringExtra(DownloadWatcherService.EXTRA_INCOMING_FILE_PATH)
+            ?.takeIf { it.isNotBlank() }
+            ?.let { extraPath ->
+                if (java.io.File(extraPath).exists()) return extraPath
+            }
 
         val directUri = when (intent.action) {
             Intent.ACTION_VIEW -> intent.data
@@ -337,6 +394,18 @@ class MainActivity : FlutterFragmentActivity() {
         }
     }
 
+    @Suppress("DEPRECATION")
+    private fun isServiceRunning(serviceClass: Class<*>): Boolean {
+        return try {
+            val activityManager =
+                getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager ?: return false
+            val running = activityManager.getRunningServices(Int.MAX_VALUE) ?: return false
+            running.any { it.service.className == serviceClass.name }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
     private fun showNotification(title: String, body: String): Boolean {
         return try {
             createNotificationChannel()
@@ -387,5 +456,48 @@ class MainActivity : FlutterFragmentActivity() {
             description = "Skan yakunlari haqida xabar beradi"
         }
         manager.createNotificationChannel(channel)
+    }
+
+    private fun checkSystemIntegrity(): Map<String, Boolean> {
+        val isRooted = detectRoot()
+        val adbEnabled = Settings.Global.getInt(
+            contentResolver, Settings.Global.ADB_ENABLED, 0
+        ) == 1
+        val testKeysBuild = Build.TAGS?.contains("test-keys") == true
+        return mapOf(
+            "isRooted" to isRooted,
+            "adbEnabled" to adbEnabled,
+            "testKeysBuild" to testKeysBuild,
+        )
+    }
+
+    private fun detectRoot(): Boolean {
+        val suPaths = listOf(
+            "/system/app/Superuser.apk",
+            "/system/xbin/su",
+            "/system/bin/su",
+            "/sbin/su",
+            "/system/su",
+            "/system/bin/.ext/.su",
+            "/system/xbin/mu",
+        )
+        if (suPaths.any { java.io.File(it).exists() }) return true
+
+        return try {
+            val process = Runtime.getRuntime().exec(arrayOf("which", "su"))
+            val result = process.inputStream.bufferedReader().readLine()
+            process.destroy()
+            !result.isNullOrBlank()
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun setScreenProtection(enabled: Boolean) {
+        if (enabled) {
+            window.addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
+        } else {
+            window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
+        }
     }
 }

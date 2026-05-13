@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:math';
 
+import 'package:crypto/crypto.dart';
+
 import 'package:flutter_device_apps/flutter_device_apps.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -16,9 +18,12 @@ import 'models/security_models.dart';
 import 'screens/agreement_screen.dart';
 import 'screens/settings_screen.dart';
 import 'services/app_scan_service.dart';
+import 'services/file_scan_io_service.dart';
 import 'services/file_scan_service.dart';
+import 'services/history_service.dart';
 import 'services/native_package_service.dart';
 import 'services/posbon_safe_service.dart';
+import 'services/whitelist_service.dart';
 import 'services/permissions_service.dart';
 import 'services/virus_total_service.dart' as vt;
 import 'widgets/animated_background.dart';
@@ -107,10 +112,14 @@ class PosbonRoot extends StatefulWidget {
 class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
   late final vt.VirusTotalService _virusTotalService;
   late final NativePackageService _nativePackageService;
-  late final AppScanService _appScanService;
+  late AppScanService _appScanService;
   late final FileScanService _fileScanService;
+  late final FileScanIoService? _fileScanIoService;
   late final PermissionsService _permissionsService;
   late final PosbonSafeService _posbonSafeService;
+  late final WhitelistService _whitelistService;
+  late final HistoryService _historyService;
+  SystemIntegrityResult? _systemIntegrity;
 
   AppStage _stage = AppStage.splash;
   DashboardTab _tab = DashboardTab.home;
@@ -155,6 +164,10 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
     _virusTotalService = vt.VirusTotalService(
       apiKey: AppConstants.virusTotalApiKey,
     );
+    _fileScanIoService =
+        AppConstants.fileScanIoApiKey.isNotEmpty
+            ? FileScanIoService(apiKey: AppConstants.fileScanIoApiKey)
+            : null;
     _appScanService = AppScanService(
       virusTotalService: _virusTotalService,
       nativePackageService: _nativePackageService,
@@ -167,6 +180,8 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
       nativePackageService: _nativePackageService,
     );
     _posbonSafeService = PosbonSafeService();
+    _whitelistService = WhitelistService();
+    _historyService = HistoryService();
     _incomingFileSubscription = _nativePackageService.incomingFiles.listen(
       _handleIncomingFile,
     );
@@ -184,6 +199,9 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
 
   void _onSettingsChanged() {
     if (!mounted) return;
+    unawaited(
+      _nativePackageService.setScreenProtection(_settings.screenProtection),
+    );
     if (_settings.liveMonitoring) {
       if (_downloadWatcherTimer == null || !_downloadWatcherTimer!.isActive) {
         _startDownloadWatcher();
@@ -191,10 +209,14 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
     } else {
       _downloadWatcherTimer?.cancel();
       _downloadWatcherTimer = null;
+      unawaited(_stopNativeWatcher());
     }
     if (_settings.locale != _lastLocale) {
       _lastLocale = _settings.locale;
       unawaited(_reloadPermissionsForLocale());
+      if (_settings.liveMonitoring) {
+        unawaited(_startNativeWatcher());
+      }
     }
     setState(() {});
   }
@@ -218,9 +240,26 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
   }
 
   Future<void> _bootstrap() async {
-    // Phase 1: load settings & permissions (fast, blocking for routing).
-    await _settings.load();
-    _permissions = await _permissionsService.loadStatuses(_tr);
+    // Phase 1: load settings then permissions. Both are wrapped with try/catch
+    // + timeout so that a hanging MethodChannel call (common on MIUI/EMUI) or
+    // a Keystore init failure never leaves the user stuck on the splash screen.
+    try {
+      await _settings.load().timeout(const Duration(seconds: 6));
+    } catch (_) {
+      // Settings failed or timed out — proceed with defaults (no agreement,
+      // no live monitoring). The user will see the agreement screen.
+    }
+
+    try {
+      _permissions = await _permissionsService
+          .loadStatuses(_tr)
+          .timeout(const Duration(seconds: 8));
+    } catch (_) {
+      // Permission checks failed or timed out — use empty list so the app
+      // routes to the permissions screen where the user can grant them.
+      _permissions = [];
+    }
+
     if (!mounted) return;
 
     // Route based on agreement and permissions. Heavy work continues after.
@@ -237,10 +276,25 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
       _stage = next;
     });
 
-    // Phase 2: heavy data loading in background.
+    // Phase 2: heavy data loading in background — independent loads run in
+    // parallel so the dashboard reaches a usable state sooner.
     unawaited(() async {
-      await _loadSafeState();
-      await _loadFiles(force: true, silent: true, seedKnownPaths: true);
+      await Future.wait<void>([
+        _loadSafeState(),
+        _loadFiles(force: true, silent: true, seedKnownPaths: true),
+        _whitelistService.load(),
+        _loadHistory(),
+        _loadSystemIntegrity(),
+      ]);
+      if (!mounted) return;
+      _appScanService = AppScanService(
+        virusTotalService: _virusTotalService,
+        nativePackageService: _nativePackageService,
+        userWhitelist: _whitelistService.packages,
+      );
+      unawaited(
+        _nativePackageService.setScreenProtection(_settings.screenProtection),
+      );
       if (_settings.liveMonitoring) {
         _startDownloadWatcher();
       }
@@ -248,12 +302,33 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
     }());
   }
 
+  Future<void> _loadHistory() async {
+    final findings = await _historyService.load();
+    if (!mounted) {
+      _history = findings;
+      return;
+    }
+    setState(() => _history = findings);
+  }
+
+  Future<void> _loadSystemIntegrity() async {
+    try {
+      final result = await _nativePackageService.checkSystemIntegrity();
+      if (!mounted) {
+        _systemIntegrity = result;
+        return;
+      }
+      setState(() => _systemIntegrity = result);
+    } catch (_) {}
+  }
+
   void _acceptAgreement() {
     unawaited(_settings.acceptAgreement());
     setState(() {
-      _stage = _hasAllRequiredPermissions
-          ? AppStage.dashboard
-          : AppStage.permissions;
+      _stage =
+          _hasAllRequiredPermissions
+              ? AppStage.dashboard
+              : AppStage.permissions;
     });
   }
 
@@ -263,6 +338,8 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
       _openResultsIfAvailable();
     } else if (destination == 'files') {
       unawaited(_openTab(DashboardTab.files));
+    } else if (destination == 'incoming_scan') {
+      // Handled by the incoming file pipeline below.
     }
 
     final path = await _nativePackageService.consumePendingOpenFile();
@@ -289,6 +366,9 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
       _openResultsIfAvailable();
     } else if (destination == 'files') {
       unawaited(_openTab(DashboardTab.files));
+    } else if (destination == 'incoming_scan') {
+      // The accompanying file path will be delivered through `incomingFiles`,
+      // which already triggers the existing scan flow.
     }
   }
 
@@ -298,6 +378,50 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
     _scanInProgress = true;
     _scanBackgroundMode = false;
     _pendingResultsNavigation = false;
+  }
+
+  void _stopScanSession() {
+    _scanStartedAt = null;
+    _scanInProgress = false;
+    _scanBackgroundMode = false;
+  }
+
+  Future<String> _sha256Of(String path) async {
+    final bytes = await File(path).readAsBytes();
+    return sha256.convert(bytes).toString();
+  }
+
+  /// Runs VT + FileScan.io in background after local result is already shown.
+  /// Updates history and sends notification only if threat level increased.
+  Future<void> _runDeepScanBackground(
+    String path,
+    ScanFinding localFinding,
+  ) async {
+    try {
+      final deepResult = await _fileScanService.scanSingleFileDeep(path);
+      final deepFinding = _fileScanService.findingFromResult(deepResult);
+      if (!mounted) return;
+      // Only update if deep scan found something the local scan missed.
+      final wasRisky = localFinding.risk.isRisky;
+      final isRisky = deepFinding.risk.isRisky;
+      setState(() {
+        _history = [
+          deepFinding,
+          ..._history.where((item) => item.location != deepFinding.location),
+        ];
+      });
+      if (isRisky && !wasRisky && _hasNotificationPermission) {
+        await _nativePackageService.showNotification(
+          title:
+              deepFinding.risk.isDangerous
+                  ? _tr.t('scan.found_dangerous')
+                  : _tr.t('scan.found_suspicious'),
+          body: deepFinding.name,
+        );
+      }
+    } catch (_) {
+      // Background scan failure is silent — local result remains.
+    }
   }
 
   Future<void> _notifyIfNeeded(List<ScanFinding> findings) async {
@@ -317,9 +441,10 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
     final suspiciousCount =
         findings.where((item) => item.risk.isSuspicious).length;
     final tr = mounted ? context.tr : AppStrings.of(_settings.locale);
-    final body = dangerousCount > 0
-        ? '$dangerousCount ${tr.t('status.dangerous').toLowerCase()}.'
-        : suspiciousCount > 0
+    final body =
+        dangerousCount > 0
+            ? '$dangerousCount ${tr.t('status.dangerous').toLowerCase()}.'
+            : suspiciousCount > 0
             ? '$suspiciousCount ${tr.t('status.suspicious').toLowerCase()}.'
             : tr.t('results.empty_desc');
     await _nativePackageService.showNotification(
@@ -343,6 +468,7 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
       }
       unawaited(_loadFiles(force: true, silent: true, seedKnownPaths: true));
       unawaited(_restorePendingOpenFile());
+      unawaited(_loadSystemIntegrity());
     }
   }
 
@@ -416,10 +542,7 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
 
   void _continueFromPermissions() {
     if (!_hasAllRequiredPermissions) {
-      _showMessage(
-        context.tr.t('permissions.body'),
-        isError: true,
-      );
+      _showMessage(context.tr.t('permissions.body'), isError: true);
       return;
     }
     final pendingPath = _pendingIncomingFilePath;
@@ -474,21 +597,22 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
 
     await Navigator.of(context).push<void>(
       MaterialPageRoute<void>(
-        builder: (context) => PosbonSafeScreen(
-          isLoading: _safeLoading,
-          unlocked: _safeUnlocked,
-          hasPin: _safeHasPin,
-          deviceAuthAvailable: _safeDeviceAuthAvailable,
-          items: _safeItems,
-          onUnlockWithDevice: _unlockSafeWithDeviceAuth,
-          onUnlockWithPin: _unlockSafeWithPin,
-          onSetPin: _setupSafePin,
-          onLock: _lockSafe,
-          onAddItem: _addSafeItem,
-          onDeleteItem: _deleteSafeItem,
-          onCopyValue: _copyValue,
-          onShowAbout: _showAboutPosbon,
-        ),
+        builder:
+            (context) => PosbonSafeScreen(
+              isLoading: _safeLoading,
+              unlocked: _safeUnlocked,
+              hasPin: _safeHasPin,
+              deviceAuthAvailable: _safeDeviceAuthAvailable,
+              items: _safeItems,
+              onUnlockWithDevice: _unlockSafeWithDeviceAuth,
+              onUnlockWithPin: _unlockSafeWithPin,
+              onSetPin: _setupSafePin,
+              onLock: _lockSafe,
+              onAddItem: _addSafeItem,
+              onDeleteItem: _deleteSafeItem,
+              onCopyValue: _copyValue,
+              onShowAbout: _showAboutPosbon,
+            ),
       ),
     );
 
@@ -535,6 +659,25 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
       const Duration(seconds: 45),
       (_) => unawaited(_checkDownloadsForThreats()),
     );
+    unawaited(_startNativeWatcher());
+  }
+
+  Future<void> _startNativeWatcher() async {
+    if (!Platform.isAndroid) return;
+    if (!_hasFileManagerPermission) return;
+    final tr = _tr;
+    await _nativePackageService.startDownloadWatcher(
+      ongoingTitle: tr.t('watcher.ongoing_title'),
+      ongoingBody: tr.t('watcher.ongoing_body'),
+      alertTitle: tr.t('watcher.alert_title'),
+      alertBody: tr.t('watcher.alert_body'),
+      stopAction: tr.t('watcher.stop_action'),
+    );
+  }
+
+  Future<void> _stopNativeWatcher() async {
+    if (!Platform.isAndroid) return;
+    await _nativePackageService.stopDownloadWatcher();
   }
 
   Future<void> _checkDownloadsForThreats() async {
@@ -549,27 +692,57 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
         setState(() => _downloadFiles = files);
       }
 
-      final newFiles = files
-          .where((file) => !_knownDownloadPaths.contains(file.path))
-          .toList();
+      final newFiles =
+          files
+              .where((file) => !_knownDownloadPaths.contains(file.path))
+              .toList();
 
       _knownDownloadPaths
         ..clear()
         ..addAll(files.map((file) => file.path));
 
       for (final file in newFiles) {
-        final result = await _fileScanService.scanSingleFile(file.path);
-        if (!result.riskLevel.isRisky) {
-          continue;
+        final isApk = file.path.toLowerCase().endsWith('.apk');
+
+        ScanFinding? finding;
+        if (isApk) {
+          final result = await _fileScanService.scanSingleFileLocally(
+            file.path,
+          );
+          if (result.riskLevel.isRisky) {
+            finding = _fileScanService.findingFromResult(result);
+          }
+        } else {
+          final fsio = _fileScanIoService;
+          if (fsio != null) {
+            final fsioResult = await fsio.checkReputation(
+              await _sha256Of(file.path),
+            );
+            if (fsioResult != null && fsioResult.hasThreat) {
+              finding = ScanFinding(
+                name: file.uri.pathSegments.last,
+                type: ScanTargetType.file,
+                risk: RiskLevel.dangerous,
+                details: fsioResult.note ?? 'FileScan.io xavfli deb baholadi',
+                reasons: [
+                  if (fsioResult.malwareName != null)
+                    '"${fsioResult.malwareName}" zararli dastur aniqlandi',
+                  ...fsioResult.iocs.take(3),
+                ],
+                location: file.path,
+              );
+            }
+          }
         }
 
-        final finding = _fileScanService.findingFromResult(result);
+        if (finding == null) continue;
         _rememberFinding(finding);
         if (_hasNotificationPermission) {
           await _nativePackageService.showNotification(
-            title: result.riskLevel.isDangerous
-                ? _tr.t('scan.found_dangerous')
-                : _tr.t('scan.found_suspicious'),
+            title:
+                finding.risk.isDangerous
+                    ? _tr.t('scan.found_dangerous')
+                    : _tr.t('scan.found_suspicious'),
             body: '${finding.name} Download.',
           );
         }
@@ -585,9 +758,7 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
       if (!mounted) return;
       setState(() => _apps = apps);
     } catch (error) {
-      _showMessage(
-        formatTemplate(_tr.t('scan.error_downloads'), {'e': error}),
-      );
+      _showMessage(formatTemplate(_tr.t('scan.error_downloads'), {'e': error}));
     } finally {
       if (mounted) {
         setState(() => _appsLoading = false);
@@ -620,7 +791,7 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
       for (var index = 0; index < targets.length; index++) {
         final scanned = await _appScanService.scanInstalledApp(
           targets[index],
-          allowVirusTotalLookup: false,
+          allowVirusTotalLookup: _settings.fullScanMode,
         );
         _replaceApp(scanned);
         findings.add(_findingFromApp(scanned));
@@ -641,6 +812,7 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
           _stage = AppStage.results;
         }
       });
+      unawaited(_historyService.save(findings));
       await _notifyIfNeeded(findings);
     } catch (error) {
       _scanStartedAt = null;
@@ -732,6 +904,7 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
           _stage = AppStage.results;
         }
       });
+      unawaited(_historyService.save(findings));
       await _notifyIfNeeded(findings);
       await _loadFiles(force: true, silent: true, seedKnownPaths: true);
     } catch (error) {
@@ -765,10 +938,12 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
 
     if (!mounted) {
       _history = updated;
+      unawaited(_historyService.save(updated));
       return;
     }
 
     setState(() => _history = updated);
+    unawaited(_historyService.save(updated));
   }
 
   void _openAppDetail(ProtectedApp app) {
@@ -787,9 +962,7 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
       if (!mounted) return;
       setState(() => _selectedApp = detailed);
     } catch (error) {
-      _showMessage(
-        formatTemplate(_tr.t('scan.error_downloads'), {'e': error}),
-      );
+      _showMessage(formatTemplate(_tr.t('scan.error_downloads'), {'e': error}));
     } finally {
       if (mounted) {
         setState(() => _detailLoading = false);
@@ -807,14 +980,9 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
       if (!mounted) return;
       setState(() => _selectedApp = scanned);
     } on vt.VirusTotalRateLimitException catch (error) {
-      _showMessage(
-        'VirusTotal limiti sabab $error',
-        isError: true,
-      );
+      _showMessage('VirusTotal limiti sabab $error', isError: true);
     } catch (error) {
-      _showMessage(
-        formatTemplate(_tr.t('scan.error_downloads'), {'e': error}),
-      );
+      _showMessage(formatTemplate(_tr.t('scan.error_downloads'), {'e': error}));
     } finally {
       if (mounted) {
         setState(() => _detailLoading = false);
@@ -863,6 +1031,7 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
     }
     _pendingIncomingFilePath = null;
     final fileName = path.split(RegExp(r'[\\/]')).last;
+    final isApk = fileName.toLowerCase().endsWith('.apk');
 
     _startScanSession();
     if (mounted) {
@@ -875,13 +1044,17 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
     }
 
     try {
-      final result = await _fileScanService.scanSingleFile(path);
-      final finding = _fileScanService.findingFromResult(result);
+      // Phase 1: fast local scan (permission analysis for APK, instant for others).
+      final localResult =
+          isApk
+              ? await _fileScanService.scanSingleFileLocally(path)
+              : await _fileScanService.scanSingleFileDeep(path);
+      final localFinding = _fileScanService.findingFromResult(localResult);
       if (!mounted) return;
       setState(() {
         _history = [
-          finding,
-          ..._history.where((item) => item.location != finding.location)
+          localFinding,
+          ..._history.where((item) => item.location != localFinding.location),
         ];
         _scannedCount = 1;
         if (_scanBackgroundMode) {
@@ -891,16 +1064,20 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
           _stage = AppStage.results;
         }
       });
-      await _notifyIfNeeded([finding]);
+      await _notifyIfNeeded([localFinding]);
+      _stopScanSession();
+
+      // Phase 2: deep cloud scan in the background for APKs only.
+      if (isApk) {
+        unawaited(_runDeepScanBackground(path, localFinding));
+      }
+
       await _loadFiles(force: true, silent: true, seedKnownPaths: true);
     } on vt.VirusTotalRateLimitException catch (error) {
       _scanStartedAt = null;
       _scanInProgress = false;
       _scanBackgroundMode = false;
-      _showMessage(
-        'VirusTotal limiti sabab $error',
-        isError: true,
-      );
+      _showMessage('VirusTotal limiti sabab $error', isError: true);
       if (mounted) {
         setState(() => _stage = AppStage.files);
       }
@@ -1050,9 +1227,7 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
 
   Future<void> _copyValue(String label, String value) async {
     await Clipboard.setData(ClipboardData(text: value));
-    _showMessage(
-      formatTemplate(_tr.t('files.copied'), {'label': label}),
-    );
+    _showMessage(formatTemplate(_tr.t('files.copied'), {'label': label}));
   }
 
   void _showAboutPosbon() {
@@ -1110,22 +1285,23 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
   }
 
   ScanFinding _findingFromApp(ProtectedApp app) {
-    final reasons = {
-      ...app.permissions
-          .where((permission) => permission.isDangerous)
-          .map((permission) => permission.explanation ?? permission.name),
-      if (app.virusTotalDetections > 0)
-        app.virusTotalThreatLabel != null &&
-                app.virusTotalThreatLabel!.isNotEmpty
-            ? 'VirusTotal: "${app.virusTotalThreatLabel}"'
-            : 'VirusTotal: ${app.virusTotalDetections}',
-      if (app.virusTotalDetections == 0 &&
-          app.virusTotalNote != null &&
-          app.virusTotalNote!.isNotEmpty)
-        app.virusTotalNote!,
-      '${_tr.t('app_detail.source')}: ${app.source}',
-      if (app.isTrusted) _tr.t('about.app_trusted_hint'),
-    }.toList();
+    final reasons =
+        {
+          ...app.permissions
+              .where((permission) => permission.isDangerous)
+              .map((permission) => permission.explanation ?? permission.name),
+          if (app.virusTotalDetections > 0)
+            app.virusTotalThreatLabel != null &&
+                    app.virusTotalThreatLabel!.isNotEmpty
+                ? 'VirusTotal: "${app.virusTotalThreatLabel}"'
+                : 'VirusTotal: ${app.virusTotalDetections}',
+          if (app.virusTotalDetections == 0 &&
+              app.virusTotalNote != null &&
+              app.virusTotalNote!.isNotEmpty)
+            app.virusTotalNote!,
+          '${_tr.t('app_detail.source')}: ${app.source}',
+          if (app.isTrusted) _tr.t('about.app_trusted_hint'),
+        }.toList();
 
     return ScanFinding(
       name: app.name,
@@ -1149,6 +1325,22 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
     }
     updatedApps[index] = app;
     _apps = updatedApps;
+  }
+
+  Future<void> _toggleWhitelist(ProtectedApp app) async {
+    if (_whitelistService.contains(app.packageName)) {
+      await _whitelistService.remove(app.packageName);
+    } else {
+      await _whitelistService.add(app.packageName);
+    }
+    _appScanService = AppScanService(
+      virusTotalService: _virusTotalService,
+      nativePackageService: _nativePackageService,
+      userWhitelist: _whitelistService.packages,
+    );
+    unawaited(_loadApps(force: true));
+    if (!mounted) return;
+    setState(() {});
   }
 
   Future<bool> _handleSystemBack() async {
@@ -1191,11 +1383,7 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
           ..hideCurrentSnackBar()
           ..hideCurrentMaterialBanner()
           ..showSnackBar(
-            _buildPosbonSnackBar(
-              messenger.context,
-              message,
-              isError: isError,
-            ),
+            _buildPosbonSnackBar(messenger.context, message, isError: isError),
           );
       } catch (_) {}
     });
@@ -1261,24 +1449,26 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
         screen = FilesScreen(
           files: _downloadFiles,
           isLoading: _filesLoading,
-          hasFilePermission: _permissions
-              .firstWhere(
-                (item) => item.id == PermissionCardId.fileManager,
-                orElse: () => const PermissionStatusCard(
-                  id: PermissionCardId.fileManager,
-                  icon: Icons.folder_open_rounded,
-                  title: '',
-                  description: '',
-                  granted: false,
-                ),
-              )
-              .granted,
+          hasFilePermission:
+              _permissions
+                  .firstWhere(
+                    (item) => item.id == PermissionCardId.fileManager,
+                    orElse:
+                        () => const PermissionStatusCard(
+                          id: PermissionCardId.fileManager,
+                          icon: Icons.folder_open_rounded,
+                          title: '',
+                          description: '',
+                          granted: false,
+                        ),
+                  )
+                  .granted,
           onRefresh: () => _loadFiles(force: true, seedKnownPaths: true),
           onScanAll: _scanAllDownloadFiles,
           onPickFiles: _pickAndScanFiles,
           onOpenFile: _scanSingleDownloadFile,
-          onOpenPermissions: () =>
-              _togglePermission(PermissionCardId.fileManager),
+          onOpenPermissions:
+              () => _togglePermission(PermissionCardId.fileManager),
           onSelectTab: (tab) {
             _openTab(tab);
           },
@@ -1321,6 +1511,11 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
         screen = AppDetailScreen(
           app: _selectedApp ?? _apps.first,
           isLoading: _detailLoading,
+          isWhitelisted: _whitelistService.contains(
+            (_selectedApp ?? (_apps.isNotEmpty ? _apps.first : null))
+                    ?.packageName ??
+                '',
+          ),
           onScan: () {
             _scanSelectedApp();
           },
@@ -1329,6 +1524,10 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
           },
           onBack: () {
             _openTab(DashboardTab.apps);
+          },
+          onWhitelistToggle: () {
+            final app = _selectedApp ?? (_apps.isNotEmpty ? _apps.first : null);
+            if (app != null) _toggleWhitelist(app);
           },
         );
         break;
@@ -1439,7 +1638,11 @@ class _SplashScreenState extends State<SplashScreen>
                 Stack(
                   alignment: Alignment.center,
                   children: [
-                    PulseRings(size: 180, color: AppColors.accent, ringCount: 3),
+                    PulseRings(
+                      size: 180,
+                      color: AppColors.accent,
+                      ringCount: 3,
+                    ),
                     const PosbonLogo(size: 96),
                   ],
                 ),
@@ -1568,9 +1771,10 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                     height: 10,
                     margin: const EdgeInsets.symmetric(horizontal: 4),
                     decoration: BoxDecoration(
-                      color: widget.currentIndex == index
-                          ? AppColors.accent
-                          : AppColors.mutedSurface,
+                      color:
+                          widget.currentIndex == index
+                              ? AppColors.accent
+                              : AppColors.mutedSurface,
                       borderRadius: BorderRadius.circular(100),
                     ),
                   ),
@@ -1793,8 +1997,8 @@ class HomeDashboardScreen extends StatelessWidget {
                         label: tr.t('status.dangerous'),
                         value: '$dangerous',
                         color: AppColors.danger,
-                        onTap: () =>
-                            onOpenResultsFiltered(RiskFilter.dangerous),
+                        onTap:
+                            () => onOpenResultsFiltered(RiskFilter.dangerous),
                       ),
                     ),
                     const SizedBox(width: 10),
@@ -1803,8 +2007,8 @@ class HomeDashboardScreen extends StatelessWidget {
                         label: tr.t('status.suspicious'),
                         value: '$suspicious',
                         color: AppColors.warning,
-                        onTap: () =>
-                            onOpenResultsFiltered(RiskFilter.suspicious),
+                        onTap:
+                            () => onOpenResultsFiltered(RiskFilter.suspicious),
                       ),
                     ),
                     const SizedBox(width: 10),
@@ -1895,9 +2099,10 @@ class _LiveMonitorRow extends StatelessWidget {
         color: AppColors.surface.withValues(alpha: 0.45),
         borderRadius: BorderRadius.circular(14),
         border: Border.all(
-          color: enabled
-              ? AppColors.accent.withValues(alpha: 0.3)
-              : AppColors.outline,
+          color:
+              enabled
+                  ? AppColors.accent.withValues(alpha: 0.3)
+                  : AppColors.outline,
         ),
       ),
       child: Row(
@@ -2280,28 +2485,30 @@ class FilesScreen extends StatelessWidget {
               ),
               const SizedBox(height: 18),
               Expanded(
-                child: isLoading
-                    ? const Center(child: CircularProgressIndicator())
-                    : RefreshIndicator(
-                        onRefresh: onRefresh,
-                        child: files.isEmpty
-                            ? ListView(
-                                children: const [
-                                  SizedBox(height: 56),
-                                  EmptyFilesState(),
-                                ],
-                              )
-                            : ListView.builder(
-                                itemCount: files.length,
-                                itemBuilder: (context, index) {
-                                  final file = files[index];
-                                  return DownloadFileTile(
-                                    file: file,
-                                    onTap: () => onOpenFile(file),
-                                  );
-                                },
-                              ),
-                      ),
+                child:
+                    isLoading
+                        ? const Center(child: CircularProgressIndicator())
+                        : RefreshIndicator(
+                          onRefresh: onRefresh,
+                          child:
+                              files.isEmpty
+                                  ? ListView(
+                                    children: const [
+                                      SizedBox(height: 56),
+                                      EmptyFilesState(),
+                                    ],
+                                  )
+                                  : ListView.builder(
+                                    itemCount: files.length,
+                                    itemBuilder: (context, index) {
+                                      final file = files[index];
+                                      return DownloadFileTile(
+                                        file: file,
+                                        onTap: () => onOpenFile(file),
+                                      );
+                                    },
+                                  ),
+                        ),
               ),
             ],
           ),
@@ -2360,14 +2567,15 @@ class _ResultsScreenState extends State<ResultsScreen> {
     final suspicious = findings.where((item) => item.risk.isSuspicious).length;
     final safe = findings.where((item) => item.risk == RiskLevel.safe).length;
 
-    final filtered = findings.where((item) {
-      return switch (_filter) {
-        RiskFilter.all => true,
-        RiskFilter.dangerous => item.risk.isDangerous,
-        RiskFilter.suspicious => item.risk.isSuspicious,
-        RiskFilter.safe => item.risk == RiskLevel.safe,
-      };
-    }).toList();
+    final filtered =
+        findings.where((item) {
+          return switch (_filter) {
+            RiskFilter.all => true,
+            RiskFilter.dangerous => item.risk.isDangerous,
+            RiskFilter.suspicious => item.risk.isSuspicious,
+            RiskFilter.safe => item.risk == RiskLevel.safe,
+          };
+        }).toList();
 
     return AnimatedAuroraBackground(
       child: Scaffold(
@@ -2402,11 +2610,13 @@ class _ResultsScreenState extends State<ResultsScreen> {
                         value: dangerous,
                         color: AppColors.danger,
                         selected: _filter == RiskFilter.dangerous,
-                        onTap: () => setState(() {
-                          _filter = _filter == RiskFilter.dangerous
-                              ? RiskFilter.all
-                              : RiskFilter.dangerous;
-                        }),
+                        onTap:
+                            () => setState(() {
+                              _filter =
+                                  _filter == RiskFilter.dangerous
+                                      ? RiskFilter.all
+                                      : RiskFilter.dangerous;
+                            }),
                       ),
                     ),
                     const SizedBox(width: 10),
@@ -2416,11 +2626,13 @@ class _ResultsScreenState extends State<ResultsScreen> {
                         value: suspicious,
                         color: AppColors.warning,
                         selected: _filter == RiskFilter.suspicious,
-                        onTap: () => setState(() {
-                          _filter = _filter == RiskFilter.suspicious
-                              ? RiskFilter.all
-                              : RiskFilter.suspicious;
-                        }),
+                        onTap:
+                            () => setState(() {
+                              _filter =
+                                  _filter == RiskFilter.suspicious
+                                      ? RiskFilter.all
+                                      : RiskFilter.suspicious;
+                            }),
                       ),
                     ),
                     const SizedBox(width: 10),
@@ -2430,30 +2642,33 @@ class _ResultsScreenState extends State<ResultsScreen> {
                         value: safe,
                         color: AppColors.accent,
                         selected: _filter == RiskFilter.safe,
-                        onTap: () => setState(() {
-                          _filter = _filter == RiskFilter.safe
-                              ? RiskFilter.all
-                              : RiskFilter.safe;
-                        }),
+                        onTap:
+                            () => setState(() {
+                              _filter =
+                                  _filter == RiskFilter.safe
+                                      ? RiskFilter.all
+                                      : RiskFilter.safe;
+                            }),
                       ),
                     ),
                   ],
                 ),
                 const SizedBox(height: 16),
                 Expanded(
-                  child: filtered.isEmpty
-                      ? const EmptySafeState()
-                      : ListView.builder(
-                          padding: const EdgeInsets.only(bottom: 16),
-                          itemCount: filtered.length,
-                          itemBuilder: (context, index) {
-                            final finding = filtered[index];
-                            return FindingTile(
-                              finding: finding,
-                              onDeleteFinding: widget.onDeleteFinding,
-                            );
-                          },
-                        ),
+                  child:
+                      filtered.isEmpty
+                          ? const EmptySafeState()
+                          : ListView.builder(
+                            padding: const EdgeInsets.only(bottom: 16),
+                            itemCount: filtered.length,
+                            itemBuilder: (context, index) {
+                              final finding = filtered[index];
+                              return FindingTile(
+                                finding: finding,
+                                onDeleteFinding: widget.onDeleteFinding,
+                              );
+                            },
+                          ),
                 ),
               ],
             ),
@@ -2494,14 +2709,14 @@ class _FilterChipCount extends StatelessWidget {
           duration: const Duration(milliseconds: 160),
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
           decoration: BoxDecoration(
-            color: selected
-                ? color.withValues(alpha: 0.18)
-                : AppColors.surface.withValues(alpha: 0.5),
+            color:
+                selected
+                    ? color.withValues(alpha: 0.18)
+                    : AppColors.surface.withValues(alpha: 0.5),
             borderRadius: BorderRadius.circular(18),
             border: Border.all(
-              color: selected
-                  ? color.withValues(alpha: 0.6)
-                  : AppColors.outline,
+              color:
+                  selected ? color.withValues(alpha: 0.6) : AppColors.outline,
             ),
           ),
           child: Column(
@@ -2562,25 +2777,26 @@ class _InstalledAppsScreenState extends State<InstalledAppsScreen> {
   @override
   Widget build(BuildContext context) {
     final tr = context.tr;
-    final filteredApps = widget.apps.where((app) {
-      final queryMatch = app.name.toLowerCase().contains(
+    final filteredApps =
+        widget.apps.where((app) {
+          final queryMatch = app.name.toLowerCase().contains(
             _query.toLowerCase(),
           );
-      if (!queryMatch) return false;
-      return switch (_filter) {
-        RiskFilter.all => true,
-        RiskFilter.dangerous => app.risk.isDangerous,
-        RiskFilter.suspicious => app.risk.isSuspicious,
-        RiskFilter.safe => app.risk == RiskLevel.safe,
-      };
-    }).toList();
+          if (!queryMatch) return false;
+          return switch (_filter) {
+            RiskFilter.all => true,
+            RiskFilter.dangerous => app.risk.isDangerous,
+            RiskFilter.suspicious => app.risk.isSuspicious,
+            RiskFilter.safe => app.risk == RiskLevel.safe,
+          };
+        }).toList();
 
     String filterLabel(RiskFilter f) => switch (f) {
-          RiskFilter.all => tr.t('status.all'),
-          RiskFilter.dangerous => tr.t('status.dangerous'),
-          RiskFilter.suspicious => tr.t('status.suspicious'),
-          RiskFilter.safe => tr.t('status.safe'),
-        };
+      RiskFilter.all => tr.t('status.all'),
+      RiskFilter.dangerous => tr.t('status.dangerous'),
+      RiskFilter.suspicious => tr.t('status.suspicious'),
+      RiskFilter.safe => tr.t('status.safe'),
+    };
 
     return Scaffold(
       body: SafeArea(
@@ -2622,57 +2838,60 @@ class _InstalledAppsScreenState extends State<InstalledAppsScreen> {
               SingleChildScrollView(
                 scrollDirection: Axis.horizontal,
                 child: Row(
-                  children: RiskFilter.values.map((filter) {
-                    final selected = _filter == filter;
-                    return Padding(
-                      padding: const EdgeInsets.only(right: 10),
-                      child: GestureDetector(
-                        onTap: () => setState(() => _filter = filter),
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 16,
-                            vertical: 10,
-                          ),
-                          decoration: BoxDecoration(
-                            color: selected
-                                ? AppColors.accent
-                                : Colors.transparent,
-                            borderRadius: BorderRadius.circular(999),
-                            border: Border.all(color: AppColors.outline),
-                          ),
-                          child: Text(
-                            filterLabel(filter),
-                            style: TextStyle(
-                              color: selected ? Colors.black : Colors.white,
-                              fontWeight: FontWeight.w600,
+                  children:
+                      RiskFilter.values.map((filter) {
+                        final selected = _filter == filter;
+                        return Padding(
+                          padding: const EdgeInsets.only(right: 10),
+                          child: GestureDetector(
+                            onTap: () => setState(() => _filter = filter),
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 16,
+                                vertical: 10,
+                              ),
+                              decoration: BoxDecoration(
+                                color:
+                                    selected
+                                        ? AppColors.accent
+                                        : Colors.transparent,
+                                borderRadius: BorderRadius.circular(999),
+                                border: Border.all(color: AppColors.outline),
+                              ),
+                              child: Text(
+                                filterLabel(filter),
+                                style: TextStyle(
+                                  color: selected ? Colors.black : Colors.white,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
                             ),
                           ),
-                        ),
-                      ),
-                    );
-                  }).toList(),
+                        );
+                      }).toList(),
                 ),
               ),
               const SizedBox(height: 18),
               Expanded(
-                child: widget.isLoading
-                    ? const Center(child: CircularProgressIndicator())
-                    : RefreshIndicator(
-                        onRefresh: widget.onRefresh,
-                        child: ListView.builder(
-                          key: const PageStorageKey<String>(
-                            'installed_apps_list',
+                child:
+                    widget.isLoading
+                        ? const Center(child: CircularProgressIndicator())
+                        : RefreshIndicator(
+                          onRefresh: widget.onRefresh,
+                          child: ListView.builder(
+                            key: const PageStorageKey<String>(
+                              'installed_apps_list',
+                            ),
+                            itemCount: filteredApps.length,
+                            itemBuilder: (context, index) {
+                              final app = filteredApps[index];
+                              return AppListTile(
+                                app: app,
+                                onTap: () => widget.onOpenApp(app),
+                              );
+                            },
                           ),
-                          itemCount: filteredApps.length,
-                          itemBuilder: (context, index) {
-                            final app = filteredApps[index];
-                            return AppListTile(
-                              app: app,
-                              onTap: () => widget.onOpenApp(app),
-                            );
-                          },
                         ),
-                      ),
               ),
             ],
           ),
@@ -2690,17 +2909,21 @@ class AppDetailScreen extends StatefulWidget {
   const AppDetailScreen({
     required this.app,
     required this.isLoading,
+    required this.isWhitelisted,
     required this.onScan,
     required this.onUninstall,
     required this.onBack,
+    required this.onWhitelistToggle,
     super.key,
   });
 
   final ProtectedApp app;
   final bool isLoading;
+  final bool isWhitelisted;
   final VoidCallback onScan;
   final VoidCallback onUninstall;
   final VoidCallback onBack;
+  final VoidCallback onWhitelistToggle;
 
   @override
   State<AppDetailScreen> createState() => _AppDetailScreenState();
@@ -2720,9 +2943,10 @@ class _AppDetailScreenState extends State<AppDetailScreen> {
   @override
   Widget build(BuildContext context) {
     final app = widget.app;
-    final permissions = _showAllPermissions || app.permissions.length <= 4
-        ? app.permissions
-        : app.permissions.take(4).toList();
+    final permissions =
+        _showAllPermissions || app.permissions.length <= 4
+            ? app.permissions
+            : app.permissions.take(4).toList();
 
     return Scaffold(
       body: SafeArea(
@@ -2746,18 +2970,19 @@ class _AppDetailScreenState extends State<AppDetailScreen> {
                       shape: BoxShape.circle,
                       border: Border.all(color: AppColors.outline),
                     ),
-                    child: app.iconBytes != null
-                        ? ClipOval(
-                            child: Image.memory(
-                              app.iconBytes!,
-                              fit: BoxFit.cover,
+                    child:
+                        app.iconBytes != null
+                            ? ClipOval(
+                              child: Image.memory(
+                                app.iconBytes!,
+                                fit: BoxFit.cover,
+                              ),
+                            )
+                            : Icon(
+                              app.icon ?? Icons.android_rounded,
+                              color: AppColors.accent,
+                              size: 34,
                             ),
-                          )
-                        : Icon(
-                            app.icon ?? Icons.android_rounded,
-                            color: AppColors.accent,
-                            size: 34,
-                          ),
                   ),
                   const SizedBox(width: 16),
                   Expanded(
@@ -2892,9 +3117,10 @@ class _AppDetailScreenState extends State<AppDetailScreen> {
                             permission.isDangerous
                                 ? Icons.warning_rounded
                                 : Icons.check_circle_outline_rounded,
-                            color: permission.isDangerous
-                                ? AppColors.danger
-                                : AppColors.accent,
+                            color:
+                                permission.isDangerous
+                                    ? AppColors.danger
+                                    : AppColors.accent,
                           ),
                         ),
                         const SizedBox(width: 10),
@@ -2927,7 +3153,8 @@ class _AppDetailScreenState extends State<AppDetailScreen> {
                   child: TextButton(
                     onPressed: () {
                       setState(
-                          () => _showAllPermissions = !_showAllPermissions);
+                        () => _showAllPermissions = !_showAllPermissions,
+                      );
                     },
                     child: Text(
                       _showAllPermissions
@@ -2952,9 +3179,10 @@ class _AppDetailScreenState extends State<AppDetailScreen> {
               SizedBox(
                 width: double.infinity,
                 child: OutlineActionButton(
-                  label: widget.isLoading
-                      ? context.tr.t('app_detail.scanning')
-                      : context.tr.t('app_detail.deep_scan'),
+                  label:
+                      widget.isLoading
+                          ? context.tr.t('app_detail.scanning')
+                          : context.tr.t('app_detail.deep_scan'),
                   onPressed: widget.isLoading ? () {} : widget.onScan,
                 ),
               ),
@@ -3040,43 +3268,43 @@ class _PosbonSafeScreenState extends State<PosbonSafeScreen> {
   @override
   Widget build(BuildContext context) {
     final query = _searchQuery.trim().toLowerCase();
-    final filteredItems = query.isEmpty
-        ? _items
-        : _items
-            .where(
-              (item) => _safeItemMatchesQuery(item, query),
-            )
-            .toList();
+    final filteredItems =
+        query.isEmpty
+            ? _items
+            : _items
+                .where((item) => _safeItemMatchesQuery(item, query))
+                .toList();
 
     return Scaffold(
       resizeToAvoidBottomInset: true,
       body: SafeArea(
-        child: _isLoading
-            ? const Center(child: CircularProgressIndicator())
-            : !_hasPin
+        child:
+            _isLoading
+                ? const Center(child: CircularProgressIndicator())
+                : !_hasPin
                 ? OverflowSafeScrollView(
-                    padding: const EdgeInsets.fromLTRB(24, 24, 24, 32),
-                    child: _buildSetupState(),
-                  )
+                  padding: const EdgeInsets.fromLTRB(24, 24, 24, 32),
+                  child: _buildSetupState(),
+                )
                 : !_isUnlocked
-                    ? OverflowSafeScrollView(
-                        padding: const EdgeInsets.fromLTRB(24, 24, 24, 32),
-                        child: _buildLockedState(),
-                      )
-                    : Padding(
-                        padding: const EdgeInsets.fromLTRB(20, 18, 20, 20),
-                        child: _buildVaultState(filteredItems),
-                      ),
+                ? OverflowSafeScrollView(
+                  padding: const EdgeInsets.fromLTRB(24, 24, 24, 32),
+                  child: _buildLockedState(),
+                )
+                : Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 18, 20, 20),
+                  child: _buildVaultState(filteredItems),
+                ),
       ),
       floatingActionButton:
           _isUnlocked && _hasPin && MediaQuery.viewInsetsOf(context).bottom == 0
               ? FloatingActionButton.extended(
-                  onPressed: _showAddCredentialSheet,
-                  backgroundColor: AppColors.accent,
-                  foregroundColor: Colors.black,
-                  icon: const Icon(Icons.add),
-                  label: Text(context.tr.t('safe.add_password')),
-                )
+                onPressed: _showAddCredentialSheet,
+                backgroundColor: AppColors.accent,
+                foregroundColor: Colors.black,
+                icon: const Icon(Icons.add),
+                label: Text(context.tr.t('safe.add_password')),
+              )
               : null,
     );
   }
@@ -3111,16 +3339,10 @@ class _PosbonSafeScreenState extends State<PosbonSafeScreen> {
           keyboardType: TextInputType.number,
         ),
         const SizedBox(height: 18),
-        PrimaryButton(
-          label: tr.t('safe.enable'),
-          onPressed: _handleSetupPin,
-        ),
+        PrimaryButton(label: tr.t('safe.enable'), onPressed: _handleSetupPin),
         if (_setupHint != null) ...[
           const SizedBox(height: 12),
-          _SafeInlineNote(
-            message: _setupHint!,
-            isError: true,
-          ),
+          _SafeInlineNote(message: _setupHint!, isError: true),
         ],
       ],
     );
@@ -3162,10 +3384,7 @@ class _PosbonSafeScreenState extends State<PosbonSafeScreen> {
         ),
         if (_unlockHint != null) ...[
           const SizedBox(height: 12),
-          _SafeInlineNote(
-            message: _unlockHint!,
-            isError: true,
-          ),
+          _SafeInlineNote(message: _unlockHint!, isError: true),
         ],
       ],
     );
@@ -3231,41 +3450,41 @@ class _PosbonSafeScreenState extends State<PosbonSafeScreen> {
           const SizedBox(height: 10),
           Text(
             tr.t('safe.search_no_results'),
-            style: const TextStyle(
-              color: AppColors.description,
-              fontSize: 13,
-            ),
+            style: const TextStyle(color: AppColors.description, fontSize: 13),
           ),
         ],
         const SizedBox(height: 12),
         Expanded(
-          child: filteredItems.isEmpty
-              ? EmptyVaultState(
-                  icon: isSearching
-                      ? Icons.search_off_rounded
-                      : Icons.lock_outline_rounded,
-                  title: isSearching
-                      ? tr.t('safe.search_no_results')
-                      : tr.t('safe.empty_title'),
-                  description: tr.t('safe.empty_desc'),
-                )
-              : ListView.builder(
-                  physics: const BouncingScrollPhysics(
-                    parent: AlwaysScrollableScrollPhysics(),
+          child:
+              filteredItems.isEmpty
+                  ? EmptyVaultState(
+                    icon:
+                        isSearching
+                            ? Icons.search_off_rounded
+                            : Icons.lock_outline_rounded,
+                    title:
+                        isSearching
+                            ? tr.t('safe.search_no_results')
+                            : tr.t('safe.empty_title'),
+                    description: tr.t('safe.empty_desc'),
+                  )
+                  : ListView.builder(
+                    physics: const BouncingScrollPhysics(
+                      parent: AlwaysScrollableScrollPhysics(),
+                    ),
+                    itemCount: filteredItems.length,
+                    itemBuilder: (context, index) {
+                      final item = filteredItems[index];
+                      return SafeCredentialTile(
+                        item: item,
+                        needsAttention: _isCredentialNeedingReview(
+                          item,
+                          allItems: _items,
+                        ),
+                        onTap: () => _showCredentialDetails(item),
+                      );
+                    },
                   ),
-                  itemCount: filteredItems.length,
-                  itemBuilder: (context, index) {
-                    final item = filteredItems[index];
-                    return SafeCredentialTile(
-                      item: item,
-                      needsAttention: _isCredentialNeedingReview(
-                        item,
-                        allItems: _items,
-                      ),
-                      onTap: () => _showCredentialDetails(item),
-                    );
-                  },
-                ),
         ),
       ],
     );
@@ -3380,16 +3599,17 @@ class _PosbonSafeScreenState extends State<PosbonSafeScreen> {
 enum _PasswordStrengthLevel { weak, okay, strong }
 
 bool _safeItemMatchesQuery(SafeCredential item, String query) {
-  final buffer = StringBuffer()
-    ..write(item.site)
-    ..write(' ')
-    ..write(item.username)
-    ..write(' ')
-    ..write(item.category.label)
-    ..write(' ')
-    ..write(item.website ?? '')
-    ..write(' ')
-    ..write(item.note ?? '');
+  final buffer =
+      StringBuffer()
+        ..write(item.site)
+        ..write(' ')
+        ..write(item.username)
+        ..write(' ')
+        ..write(item.category.label)
+        ..write(' ')
+        ..write(item.website ?? '')
+        ..write(' ')
+        ..write(item.note ?? '');
 
   return buffer.toString().toLowerCase().contains(query);
 }
@@ -3415,7 +3635,8 @@ int _passwordStrengthScore(String value) {
     'asdf',
     'admin',
   ];
-  final hasRiskyPattern = riskyPatterns.any(lower.contains) ||
+  final hasRiskyPattern =
+      riskyPatterns.any(lower.contains) ||
       RegExp(r'(.)\1{2,}').hasMatch(password) ||
       RegExp(r'0123|1234|2345|3456|abcd|bcde|cdef').hasMatch(lower);
 
@@ -3469,25 +3690,18 @@ bool _isCredentialNeedingReview(
 
 int _countCredentialsNeedingReview(List<SafeCredential> items) {
   return items
-      .where(
-        (item) => _isCredentialNeedingReview(item, allItems: items),
-      )
+      .where((item) => _isCredentialNeedingReview(item, allItems: items))
       .length;
 }
 
-SafeCategory _suggestSafeCategory({
-  required String site,
-  String? website,
-}) {
+SafeCategory _suggestSafeCategory({required String site, String? website}) {
   final source = '${site.toLowerCase()} ${website?.toLowerCase() ?? ''}';
   if (RegExp(
     r'bank|click|payme|visa|master|kapital|uzum|card|wallet',
   ).hasMatch(source)) {
     return SafeCategory.banking;
   }
-  if (RegExp(
-    r'mail|gmail|outlook|yahoo|proton|icloud',
-  ).hasMatch(source)) {
+  if (RegExp(r'mail|gmail|outlook|yahoo|proton|icloud').hasMatch(source)) {
     return SafeCategory.email;
   }
   if (RegExp(
@@ -3617,9 +3831,7 @@ class _AddCredentialSheetState extends State<_AddCredentialSheet> {
     messenger
       ..hideCurrentSnackBar()
       ..hideCurrentMaterialBanner()
-      ..showSnackBar(
-        _buildPosbonSnackBar(context, message, isError: isError),
-      );
+      ..showSnackBar(_buildPosbonSnackBar(context, message, isError: isError));
   }
 
   Future<void> _submit() async {
@@ -3669,8 +3881,9 @@ class _AddCredentialSheetState extends State<_AddCredentialSheet> {
     return AnimatedPadding(
       duration: const Duration(milliseconds: 180),
       curve: Curves.easeOut,
-      padding:
-          EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
+      padding: EdgeInsets.only(
+        bottom: MediaQuery.of(context).viewInsets.bottom,
+      ),
       child: Padding(
         padding: const EdgeInsets.fromLTRB(20, 10, 20, 20),
         child: SingleChildScrollView(
@@ -3992,59 +4205,60 @@ class _AddCredentialSheetState extends State<_AddCredentialSheet> {
               AnimatedSize(
                 duration: const Duration(milliseconds: 180),
                 curve: Curves.easeOut,
-                child: _showAdvanced
-                    ? Padding(
-                        padding: const EdgeInsets.only(top: 14),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            _FieldLabel(
-                              title: tr.t('safe.category'),
-                              helper: tr.t('safe.category_helper'),
-                            ),
-                            const SizedBox(height: 8),
-                            SingleChildScrollView(
-                              scrollDirection: Axis.horizontal,
-                              physics: const BouncingScrollPhysics(),
-                              child: Row(
-                                children: SafeCategory.values
-                                    .map(
-                                      (value) => _CategoryChip(
-                                        label: value.label,
-                                        selected: _category == value,
-                                        onTap: () {
-                                          setState(() {
-                                            _categoryLockedByUser = true;
-                                            _category = value;
-                                          });
-                                        },
-                                      ),
-                                    )
-                                    .toList(),
+                child:
+                    _showAdvanced
+                        ? Padding(
+                          padding: const EdgeInsets.only(top: 14),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              _FieldLabel(
+                                title: tr.t('safe.category'),
+                                helper: tr.t('safe.category_helper'),
                               ),
-                            ),
-                            const SizedBox(height: 16),
-                            _FieldLabel(
-                              title: tr.t('safe.field_note'),
-                              helper: tr.t('safe.field_note_helper'),
-                            ),
-                            const SizedBox(height: 8),
-                            _SafeField(
-                              controller: _noteController,
-                              hintText: tr.t('safe.note'),
-                              maxLines: 3,
-                              textCapitalization: TextCapitalization.sentences,
-                            ),
-                          ],
-                        ),
-                      )
-                    : const SizedBox.shrink(),
+                              const SizedBox(height: 8),
+                              SingleChildScrollView(
+                                scrollDirection: Axis.horizontal,
+                                physics: const BouncingScrollPhysics(),
+                                child: Row(
+                                  children:
+                                      SafeCategory.values
+                                          .map(
+                                            (value) => _CategoryChip(
+                                              label: value.label,
+                                              selected: _category == value,
+                                              onTap: () {
+                                                setState(() {
+                                                  _categoryLockedByUser = true;
+                                                  _category = value;
+                                                });
+                                              },
+                                            ),
+                                          )
+                                          .toList(),
+                                ),
+                              ),
+                              const SizedBox(height: 16),
+                              _FieldLabel(
+                                title: tr.t('safe.field_note'),
+                                helper: tr.t('safe.field_note_helper'),
+                              ),
+                              const SizedBox(height: 8),
+                              _SafeField(
+                                controller: _noteController,
+                                hintText: tr.t('safe.note'),
+                                maxLines: 3,
+                                textCapitalization:
+                                    TextCapitalization.sentences,
+                              ),
+                            ],
+                          ),
+                        )
+                        : const SizedBox.shrink(),
               ),
               const SizedBox(height: 20),
               PrimaryButton(
-                label: _isSaving
-                    ? tr.t('safe.saving')
-                    : tr.t('safe.save'),
+                label: _isSaving ? tr.t('safe.saving') : tr.t('safe.save'),
                 onPressed: _isSaving ? () {} : _submit,
               ),
             ],
@@ -4075,10 +4289,7 @@ class _FieldLabel extends StatelessWidget {
           children: [
             Text(
               title,
-              style: const TextStyle(
-                fontSize: 14,
-                fontWeight: FontWeight.w700,
-              ),
+              style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w700),
             ),
             if (isRequired) ...[
               const SizedBox(width: 6),
@@ -4117,10 +4328,7 @@ class _FieldLabel extends StatelessWidget {
 }
 
 class _SafeSectionTitle extends StatelessWidget {
-  const _SafeSectionTitle({
-    required this.title,
-    required this.description,
-  });
+  const _SafeSectionTitle({required this.title, required this.description});
 
   final String title;
   final String description;
@@ -4149,10 +4357,7 @@ class _SafeSectionTitle extends StatelessWidget {
 }
 
 class _SheetInfoPill extends StatelessWidget {
-  const _SheetInfoPill({
-    required this.icon,
-    required this.label,
-  });
+  const _SheetInfoPill({required this.icon, required this.label});
 
   final IconData icon;
   final String label;
@@ -4205,10 +4410,7 @@ class _SafeTopBar extends StatelessWidget {
     return Row(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        _GlassIconButton(
-          icon: Icons.arrow_back_ios_new_rounded,
-          onTap: onBack,
-        ),
+        _GlassIconButton(icon: Icons.arrow_back_ios_new_rounded, onTap: onBack),
         const SizedBox(width: 12),
         Expanded(
           child: Padding(
@@ -4237,24 +4439,15 @@ class _SafeTopBar extends StatelessWidget {
             ),
           ),
         ),
-        if (trailing != null) ...[
-          trailing!,
-          const SizedBox(width: 8),
-        ],
-        _GlassIconButton(
-          icon: Icons.info_outline_rounded,
-          onTap: onInfo,
-        ),
+        if (trailing != null) ...[trailing!, const SizedBox(width: 8)],
+        _GlassIconButton(icon: Icons.info_outline_rounded, onTap: onInfo),
       ],
     );
   }
 }
 
 class _GlassIconButton extends StatelessWidget {
-  const _GlassIconButton({
-    required this.icon,
-    required this.onTap,
-  });
+  const _GlassIconButton({required this.icon, required this.onTap});
 
   final IconData icon;
   final VoidCallback onTap;
@@ -4321,10 +4514,7 @@ class _SafeMetaPill extends StatelessWidget {
 }
 
 class _SafeInlineNote extends StatelessWidget {
-  const _SafeInlineNote({
-    required this.message,
-    this.isError = false,
-  });
+  const _SafeInlineNote({required this.message, this.isError = false});
 
   final String message;
   final bool isError;
@@ -4351,11 +4541,7 @@ class _SafeInlineNote extends StatelessWidget {
           Expanded(
             child: Text(
               message,
-              style: TextStyle(
-                color: color,
-                fontSize: 13,
-                height: 1.35,
-              ),
+              style: TextStyle(color: color, fontSize: 13, height: 1.35),
             ),
           ),
         ],
@@ -4395,15 +4581,16 @@ class _SafeSearchField extends StatelessWidget {
           Icons.search_rounded,
           color: AppColors.description,
         ),
-        suffixIcon: controller.text.isEmpty
-            ? null
-            : IconButton(
-                onPressed: onClear,
-                icon: const Icon(
-                  Icons.close_rounded,
-                  color: AppColors.description,
+        suffixIcon:
+            controller.text.isEmpty
+                ? null
+                : IconButton(
+                  onPressed: onClear,
+                  icon: const Icon(
+                    Icons.close_rounded,
+                    color: AppColors.description,
+                  ),
                 ),
-              ),
         border: OutlineInputBorder(
           borderRadius: BorderRadius.circular(16),
           borderSide: const BorderSide(color: AppColors.outline),
@@ -4481,9 +4668,7 @@ class PosbonBottomNav extends StatelessWidget {
             decoration: BoxDecoration(
               color: AppColors.secondarySurface.withValues(alpha: 0.82),
               borderRadius: BorderRadius.circular(28),
-              border: Border.all(
-                color: Colors.white.withValues(alpha: 0.06),
-              ),
+              border: Border.all(color: Colors.white.withValues(alpha: 0.06)),
               boxShadow: [
                 BoxShadow(
                   color: Colors.black.withValues(alpha: 0.35),
@@ -4562,9 +4747,10 @@ class _NavItem extends StatelessWidget {
           curve: Curves.easeOut,
           padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 6),
           decoration: BoxDecoration(
-            color: selected
-                ? AppColors.accent.withValues(alpha: 0.16)
-                : Colors.transparent,
+            color:
+                selected
+                    ? AppColors.accent.withValues(alpha: 0.16)
+                    : Colors.transparent,
             borderRadius: BorderRadius.circular(20),
           ),
           child: Column(
@@ -4760,23 +4946,23 @@ class PermissionTile extends StatelessWidget {
           const SizedBox(width: 10),
           item.granted
               ? Container(
-                  width: 42,
-                  height: 42,
-                  decoration: BoxDecoration(
-                    color: AppColors.accent,
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: const Icon(Icons.check, color: Colors.black),
-                )
-                  : item.actionable
-                      ? SizedBox(
-                          width: 110,
-                          child: OutlineActionButton(
-                            label: context.tr.t('permissions.grant'),
-                            onPressed: onGrant,
-                          ),
-                        )
-                  : const SizedBox.shrink(),
+                width: 42,
+                height: 42,
+                decoration: BoxDecoration(
+                  color: AppColors.accent,
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: const Icon(Icons.check, color: Colors.black),
+              )
+              : item.actionable
+              ? SizedBox(
+                width: 110,
+                child: OutlineActionButton(
+                  label: context.tr.t('permissions.grant'),
+                  onPressed: onGrant,
+                ),
+              )
+              : const SizedBox.shrink(),
         ],
       ),
     );
@@ -4809,17 +4995,12 @@ class StatCard extends StatelessWidget {
           padding: const EdgeInsets.all(14),
           decoration: BoxDecoration(
             gradient: LinearGradient(
-              colors: [
-                accent.withValues(alpha: 0.18),
-                const Color(0xFF0E1E1A),
-              ],
+              colors: [accent.withValues(alpha: 0.18), const Color(0xFF0E1E1A)],
               begin: Alignment.topLeft,
               end: Alignment.bottomRight,
             ),
             borderRadius: BorderRadius.circular(20),
-            border: Border.all(
-              color: accent.withValues(alpha: 0.35),
-            ),
+            border: Border.all(color: accent.withValues(alpha: 0.35)),
           ),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -4864,9 +5045,12 @@ class _HomeHeroCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final tr = context.tr;
-    final findingLabel = findings.isEmpty
-        ? tr.t('home.no_results')
-        : formatTemplate(tr.t('home.results_count'), {'n': findings.length});
+    final findingLabel =
+        findings.isEmpty
+            ? tr.t('home.no_results')
+            : formatTemplate(tr.t('home.results_count'), {
+              'n': findings.length,
+            });
 
     return Container(
       width: double.infinity,
@@ -4956,8 +5140,7 @@ class _ScanLaunchButton extends StatelessWidget {
                 child: Stack(
                   alignment: Alignment.center,
                   children: [
-                    if (scanning)
-                      RadarSweep(size: 64, color: AppColors.accent),
+                    if (scanning) RadarSweep(size: 64, color: AppColors.accent),
                     Container(
                       width: 54,
                       height: 54,
@@ -5011,9 +5194,7 @@ class _ScanLaunchButton extends StatelessWidget {
                   borderRadius: BorderRadius.circular(12),
                 ),
                 child: Icon(
-                  scanning
-                      ? Icons.stop_rounded
-                      : Icons.arrow_forward_rounded,
+                  scanning ? Icons.stop_rounded : Icons.arrow_forward_rounded,
                   color: Colors.black,
                 ),
               ),
@@ -5239,10 +5420,11 @@ class FindingTile extends StatelessWidget {
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
       ),
-      builder: (context) => FindingDetailsSheet(
-        finding: finding,
-        onDeleteFinding: onDeleteFinding,
-      ),
+      builder:
+          (context) => FindingDetailsSheet(
+            finding: finding,
+            onDeleteFinding: onDeleteFinding,
+          ),
     );
   }
 }
@@ -5416,18 +5598,20 @@ class _VirusTotalStatusCard extends StatelessWidget {
     final borderColor = isDanger ? AppColors.danger : AppColors.outline;
     final backgroundColor =
         isDanger ? AppColors.danger.withValues(alpha: 0.10) : AppColors.surface;
-    final title = isDanger
-        ? tr.t('results.vt_dangerous')
-        : app.vtScanned
+    final title =
+        isDanger
+            ? tr.t('results.vt_dangerous')
+            : app.vtScanned
             ? tr.t('results.vt_clean')
             : tr.t('results.vt_not_scanned');
 
-    final subtitle = isDanger
-        ? app.virusTotalThreatLabel != null &&
-                app.virusTotalThreatLabel!.isNotEmpty
-            ? app.virusTotalThreatLabel!
-            : '${app.virusTotalDetections}'
-        : app.virusTotalNote ?? '';
+    final subtitle =
+        isDanger
+            ? app.virusTotalThreatLabel != null &&
+                    app.virusTotalThreatLabel!.isNotEmpty
+                ? app.virusTotalThreatLabel!
+                : '${app.virusTotalDetections}'
+            : app.virusTotalNote ?? '';
 
     return Container(
       width: double.infinity,
@@ -5481,19 +5665,13 @@ class EmptyFilesState extends StatelessWidget {
           const SizedBox(height: 16),
           Text(
             tr.t('files.empty_download'),
-            style: const TextStyle(
-              fontSize: 20,
-              fontWeight: FontWeight.w700,
-            ),
+            style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w700),
           ),
           const SizedBox(height: 8),
           Text(
             tr.t('files.subtitle_no_perm_long'),
             textAlign: TextAlign.center,
-            style: const TextStyle(
-              color: AppColors.description,
-              fontSize: 14,
-            ),
+            style: const TextStyle(color: AppColors.description, fontSize: 14),
           ),
         ],
       ),
@@ -5510,16 +5688,18 @@ class DownloadFileTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final exists = _fileExists(file);
-    final lastModified = exists
-        ? (_tryLastModified(file) ?? DateTime.fromMillisecondsSinceEpoch(0))
-        : DateTime.fromMillisecondsSinceEpoch(0);
+    final lastModified =
+        exists
+            ? (_tryLastModified(file) ?? DateTime.fromMillisecondsSinceEpoch(0))
+            : DateTime.fromMillisecondsSinceEpoch(0);
     final fileSize = exists ? _tryFileLength(file) : null;
     final tr = context.tr;
-    final sizeLabel = exists
-        ? fileSize == null
-            ? tr.t('files.size_unknown')
-            : _formatFileSize(fileSize)
-        : tr.t('files.moved');
+    final sizeLabel =
+        exists
+            ? fileSize == null
+                ? tr.t('files.size_unknown')
+                : _formatFileSize(fileSize)
+            : tr.t('files.moved');
 
     return InkWell(
       onTap: exists ? onTap : null,
@@ -5542,10 +5722,7 @@ class DownloadFileTile extends StatelessWidget {
                 borderRadius: BorderRadius.circular(14),
                 border: Border.all(color: AppColors.outline),
               ),
-              child: const Icon(
-                Icons.android_rounded,
-                color: AppColors.accent,
-              ),
+              child: const Icon(Icons.android_rounded, color: AppColors.accent),
             ),
             const SizedBox(width: 14),
             Expanded(
@@ -5595,10 +5772,7 @@ class DownloadFileTile extends StatelessWidget {
 }
 
 class _SafeHeroCard extends StatelessWidget {
-  const _SafeHeroCard({
-    required this.title,
-    required this.description,
-  });
+  const _SafeHeroCard({required this.title, required this.description});
 
   final String title;
   final String description;
@@ -5625,8 +5799,10 @@ class _SafeHeroCard extends StatelessWidget {
               const PosbonLogo(size: 44),
               const SizedBox(width: 12),
               Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 10,
+                  vertical: 6,
+                ),
                 decoration: BoxDecoration(
                   color: Colors.white.withValues(alpha: 0.08),
                   borderRadius: BorderRadius.circular(999),
@@ -5733,19 +5909,20 @@ class _SafeFieldState extends State<_SafeField> {
           borderRadius: BorderRadius.circular(18),
           borderSide: const BorderSide(color: AppColors.accent),
         ),
-        suffixIcon: widget.obscureText
-            ? IconButton(
-                onPressed: () {
-                  setState(() => _obscureText = !_obscureText);
-                },
-                icon: Icon(
-                  _obscureText
-                      ? Icons.visibility_off_outlined
-                      : Icons.visibility_outlined,
-                  color: AppColors.description,
-                ),
-              )
-            : null,
+        suffixIcon:
+            widget.obscureText
+                ? IconButton(
+                  onPressed: () {
+                    setState(() => _obscureText = !_obscureText);
+                  },
+                  icon: Icon(
+                    _obscureText
+                        ? Icons.visibility_off_outlined
+                        : Icons.visibility_outlined,
+                    color: AppColors.description,
+                  ),
+                )
+                : null,
       ),
     );
   }
@@ -5772,9 +5949,10 @@ class _CategoryChip extends StatelessWidget {
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
           decoration: BoxDecoration(
-            color: selected
-                ? AppColors.accent
-                : AppColors.mutedSurface.withValues(alpha: 0.35),
+            color:
+                selected
+                    ? AppColors.accent
+                    : AppColors.mutedSurface.withValues(alpha: 0.35),
             borderRadius: BorderRadius.circular(999),
             border: Border.all(
               color: selected ? AppColors.accent : AppColors.outline,
@@ -5812,9 +5990,10 @@ class _GeneratorToggle extends StatelessWidget {
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
         decoration: BoxDecoration(
-          color: selected
-              ? AppColors.accent.withValues(alpha: 0.14)
-              : AppColors.mutedSurface.withValues(alpha: 0.4),
+          color:
+              selected
+                  ? AppColors.accent.withValues(alpha: 0.14)
+                  : AppColors.mutedSurface.withValues(alpha: 0.4),
           borderRadius: BorderRadius.circular(16),
           border: Border.all(
             color: selected ? AppColors.accent : AppColors.outline,
@@ -5829,10 +6008,7 @@ class _GeneratorToggle extends StatelessWidget {
               size: 18,
             ),
             const SizedBox(width: 8),
-            Text(
-              label,
-              style: const TextStyle(fontWeight: FontWeight.w600),
-            ),
+            Text(label, style: const TextStyle(fontWeight: FontWeight.w600)),
           ],
         ),
       ),
@@ -5878,11 +6054,12 @@ class EmptyVaultState extends StatelessWidget {
 }
 
 class SafeCredentialTile extends StatelessWidget {
-  const SafeCredentialTile(
-      {required this.item,
-      required this.onTap,
-      this.needsAttention = false,
-      super.key});
+  const SafeCredentialTile({
+    required this.item,
+    required this.onTap,
+    this.needsAttention = false,
+    super.key,
+  });
 
   final SafeCredential item;
   final VoidCallback onTap;
@@ -5890,9 +6067,10 @@ class SafeCredentialTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final subtitle = item.username.isNotEmpty
-        ? item.username
-        : (item.website?.isNotEmpty ?? false)
+    final subtitle =
+        item.username.isNotEmpty
+            ? item.username
+            : (item.website?.isNotEmpty ?? false)
             ? item.website!
             : context.tr.t('safe.login_none');
 
@@ -5997,10 +6175,7 @@ class SafeCredentialTile extends StatelessWidget {
             const Column(
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
-                Icon(
-                  Icons.chevron_right_rounded,
-                  color: AppColors.description,
-                ),
+                Icon(Icons.chevron_right_rounded, color: AppColors.description),
               ],
             ),
           ],
@@ -6066,8 +6241,10 @@ class _SafeCredentialSheetState extends State<_SafeCredentialSheet> {
                     ),
                   ),
                   Container(
-                    padding:
-                        const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 6,
+                    ),
                     decoration: BoxDecoration(
                       color: AppColors.accent.withValues(alpha: 0.12),
                       borderRadius: BorderRadius.circular(999),
@@ -6085,12 +6262,14 @@ class _SafeCredentialSheetState extends State<_SafeCredentialSheet> {
               const SizedBox(height: 18),
               _DetailRow(
                 label: context.tr.t('safe.login'),
-                value: item.username.isEmpty
-                    ? context.tr.t('safe.login_not_set')
-                    : item.username,
-                onCopy: item.username.isEmpty
-                    ? null
-                    : () => widget.onCopyValue(
+                value:
+                    item.username.isEmpty
+                        ? context.tr.t('safe.login_not_set')
+                        : item.username,
+                onCopy:
+                    item.username.isEmpty
+                        ? null
+                        : () => widget.onCopyValue(
                           context.tr.t('safe.login'),
                           item.username,
                         ),
@@ -6111,10 +6290,11 @@ class _SafeCredentialSheetState extends State<_SafeCredentialSheet> {
                     color: AppColors.description,
                   ),
                 ),
-                onCopy: () => widget.onCopyValue(
-                  context.tr.t('safe.password'),
-                  item.password,
-                ),
+                onCopy:
+                    () => widget.onCopyValue(
+                      context.tr.t('safe.password'),
+                      item.password,
+                    ),
               ),
               if (item.note != null && item.note!.isNotEmpty) ...[
                 const SizedBox(height: 12),
@@ -6266,18 +6446,12 @@ class EmptySafeState extends StatelessWidget {
           const SizedBox(height: 18),
           Text(
             tr.t('results.empty_title'),
-            style: const TextStyle(
-              fontSize: 24,
-              fontWeight: FontWeight.w700,
-            ),
+            style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w700),
           ),
           const SizedBox(height: 8),
           Text(
             tr.t('results.empty_desc'),
-            style: const TextStyle(
-              color: AppColors.description,
-              fontSize: 14,
-            ),
+            style: const TextStyle(color: AppColors.description, fontSize: 14),
           ),
         ],
       ),
@@ -6314,14 +6488,15 @@ class AppListTile extends StatelessWidget {
                 shape: BoxShape.circle,
                 border: Border.all(color: AppColors.outline),
               ),
-              child: app.iconBytes != null
-                  ? ClipOval(
-                      child: Image.memory(app.iconBytes!, fit: BoxFit.cover),
-                    )
-                  : Icon(
-                      app.icon ?? Icons.android_rounded,
-                      color: AppColors.accent,
-                    ),
+              child:
+                  app.iconBytes != null
+                      ? ClipOval(
+                        child: Image.memory(app.iconBytes!, fit: BoxFit.cover),
+                      )
+                      : Icon(
+                        app.icon ?? Icons.android_rounded,
+                        color: AppColors.accent,
+                      ),
             ),
             const SizedBox(width: 14),
             Expanded(
@@ -6409,8 +6584,9 @@ SnackBar _buildPosbonSnackBar(
           width: 36,
           height: 36,
           decoration: BoxDecoration(
-            color: (isError ? AppColors.danger : AppColors.accent)
-                .withValues(alpha: 0.14),
+            color: (isError ? AppColors.danger : AppColors.accent).withValues(
+              alpha: 0.14,
+            ),
             shape: BoxShape.circle,
           ),
           child: Icon(

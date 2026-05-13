@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:crypto/crypto.dart';
 
 import '../models/security_models.dart';
+import 'file_scan_io_service.dart';
 import 'permission_analyzer.dart';
 import 'virus_total_service.dart';
 
@@ -17,6 +18,7 @@ class ApkScanResult {
     required this.vtResult,
     required this.installSource,
     required this.scannedAt,
+    this.fsioResult,
   });
 
   final String filePath;
@@ -26,6 +28,7 @@ class ApkScanResult {
   final int finalScore;
   final PermissionResult permissionResult;
   final VirusTotalResult vtResult;
+  final FileScanIoResult? fsioResult;
   final String installSource;
   final DateTime scannedAt;
 
@@ -62,6 +65,11 @@ class ApkScanResult {
       parts.add('VirusTotal hali ma\'lumot bermadi');
     }
 
+    final fsio = fsioResult;
+    if (fsio != null && fsio.note != null && fsio.note!.isNotEmpty) {
+      parts.add(fsio.note!);
+    }
+
     return parts.join('. ');
   }
 }
@@ -70,11 +78,14 @@ class ApkScanEngine {
   ApkScanEngine({
     required PermissionAnalyzer permissionAnalyzer,
     required VirusTotalService virusTotalService,
+    FileScanIoService? fileScanIoService,
   })  : _permissionAnalyzer = permissionAnalyzer,
-        _virusTotalService = virusTotalService;
+        _virusTotalService = virusTotalService,
+        _fileScanIoService = fileScanIoService;
 
   final PermissionAnalyzer _permissionAnalyzer;
   final VirusTotalService _virusTotalService;
+  final FileScanIoService? _fileScanIoService;
 
   Future<ApkScanResult> scanApk({
     required String filePath,
@@ -85,18 +96,26 @@ class ApkScanEngine {
       throw Exception('APK topilmadi: $filePath');
     }
 
-    final bytes = await file.readAsBytes();
-    final sha256Hash = sha256.convert(bytes).toString();
+    final sha256Hash = await _sha256OfFile(filePath);
 
-    final results = await Future.wait<dynamic>([
+    final futures = <Future<dynamic>>[
       _permissionAnalyzer.analyze(filePath),
       _virusTotalService.checkByHash(filePath),
-    ]);
+      if (_fileScanIoService != null)
+        _fileScanIoService.scanFile(filePath)
+      else
+        Future.value(null),
+    ];
+
+    final results = await Future.wait<dynamic>(futures);
 
     final permissionResult = results[0] as PermissionResult;
     final vtResult = results[1] as VirusTotalResult;
+    final fsioResult = results[2] as FileScanIoResult?;
 
-    var finalScore = permissionResult.permissionScore + vtResult.vtScore;
+    var finalScore = permissionResult.permissionScore +
+        vtResult.vtScore +
+        (fsioResult?.fsioScore ?? 0);
     finalScore += _installerBonus(installerPackage);
     finalScore = finalScore.clamp(0, 100);
 
@@ -104,10 +123,15 @@ class ApkScanEngine {
       filePath: filePath,
       fileName: file.uri.pathSegments.last,
       sha256Hash: sha256Hash,
-      riskLevel: _riskFromScore(finalScore, vtResult: vtResult),
+      riskLevel: _riskFromScore(
+        finalScore,
+        vtResult: vtResult,
+        fsioResult: fsioResult,
+      ),
       finalScore: finalScore,
       permissionResult: permissionResult,
       vtResult: vtResult,
+      fsioResult: fsioResult,
       installSource: _installerLabel(installerPackage),
       scannedAt: DateTime.now(),
     );
@@ -123,8 +147,6 @@ class ApkScanEngine {
       throw Exception('APK topilmadi: $filePath');
     }
 
-    final bytes = await file.readAsBytes();
-    final sha256Hash = sha256.convert(bytes).toString();
     final permissionResult = await _permissionAnalyzer.analyze(filePath);
 
     var finalScore = permissionResult.permissionScore;
@@ -136,7 +158,7 @@ class ApkScanEngine {
     return ApkScanResult(
       filePath: filePath,
       fileName: file.uri.pathSegments.last,
-      sha256Hash: sha256Hash,
+      sha256Hash: '',
       riskLevel: _riskFromScore(
         finalScore,
         vtResult: const VirusTotalResult(
@@ -162,6 +184,18 @@ class ApkScanEngine {
     );
   }
 
+  Future<String> _sha256OfFile(String path) async {
+    Digest? result;
+    final inputSink = sha256.startChunkedConversion(
+      _DigestSink((d) => result = d),
+    );
+    await for (final chunk in File(path).openRead()) {
+      inputSink.add(chunk);
+    }
+    inputSink.close();
+    return result!.toString();
+  }
+
   int _installerBonus(String? installerPackage) {
     if (installerPackage == 'com.android.vending') return -10;
     if (installerPackage == 'com.telegram.messenger' ||
@@ -185,11 +219,21 @@ class ApkScanEngine {
   RiskLevel _riskFromScore(
     int score, {
     required VirusTotalResult vtResult,
+    FileScanIoResult? fsioResult,
   }) {
-    if (vtResult.detectedCount > 0) {
+    if (vtResult.detectedCount > 0 || (fsioResult?.hasThreat ?? false)) {
       return RiskLevel.dangerous;
     }
     if (score >= 28) return RiskLevel.suspicious;
     return RiskLevel.safe;
   }
+}
+
+class _DigestSink implements Sink<Digest> {
+  _DigestSink(this._onDigest);
+  final void Function(Digest) _onDigest;
+  @override
+  void add(Digest data) => _onDigest(data);
+  @override
+  void close() {}
 }

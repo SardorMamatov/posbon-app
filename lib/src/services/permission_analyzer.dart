@@ -1,8 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
-
-import 'package:archive/archive.dart';
 import 'package:flutter/foundation.dart';
+import 'apk_manifest_reader.dart';
 
 class PermissionResult {
   const PermissionResult({
@@ -79,8 +78,7 @@ class PermissionAnalyzer {
       throw Exception('APK topilmadi: $filePath');
     }
 
-    final apkBytes = await file.readAsBytes();
-    final payload = await compute(_analyzePermissionPayload, apkBytes);
+    final payload = await compute(_analyzePermissionPayloadFromPath, filePath);
     return _permissionResultFromPayload(payload);
   }
 
@@ -91,27 +89,35 @@ class PermissionAnalyzer {
             .toList();
 
     return PermissionResult(
-      allPermissions: (payload['allPermissions'] as List<Object?>? ?? const [])
-          .whereType<String>()
-          .toList(),
-      dangerousPermissions: dangerousPayload
-          .map(
-            (item) => DangerousPermission(
-              name: item['name']?.toString() ?? '',
-              score: (item['score'] as num?)?.toInt() ?? 0,
-              reason: item['reason']?.toString() ?? 'Xavfli ruxsat aniqlandi',
-            ),
-          )
-          .toList(),
-      detectedCombos: (payload['detectedCombos'] as List<Object?>? ?? const [])
-          .whereType<String>()
-          .toList(),
+      allPermissions:
+          (payload['allPermissions'] as List<Object?>? ?? const [])
+              .whereType<String>()
+              .toList(),
+      dangerousPermissions:
+          dangerousPayload
+              .map(
+                (item) => DangerousPermission(
+                  name: item['name']?.toString() ?? '',
+                  score: (item['score'] as num?)?.toInt() ?? 0,
+                  reason:
+                      item['reason']?.toString() ?? 'Xavfli ruxsat aniqlandi',
+                ),
+              )
+              .toList(),
+      detectedCombos:
+          (payload['detectedCombos'] as List<Object?>? ?? const [])
+              .whereType<String>()
+              .toList(),
       permissionScore: (payload['permissionScore'] as num?)?.toInt() ?? 0,
     );
   }
 
-  PermissionResult _analyzeBytes(Uint8List apkBytes) {
-    final permissions = _extractPermissionsFromApk(apkBytes);
+  PermissionResult _analyzeManifestBytes(Uint8List manifestBytes) {
+    final permissions = _parseBinaryXml(manifestBytes);
+    return _analyzePermissionList(permissions);
+  }
+
+  PermissionResult _analyzePermissionList(List<String> permissions) {
     final permissionSet = permissions.toSet();
     final dangerousPermissions = <DangerousPermission>[];
     var score = 0;
@@ -176,20 +182,6 @@ class PermissionAnalyzer {
 
   bool _hasAll(Set<String> source, List<String> values) =>
       values.every(source.contains);
-
-  List<String> _extractPermissionsFromApk(List<int> apkBytes) {
-    final archive = ZipDecoder().decodeBytes(apkBytes);
-    final manifest =
-        archive.files.where((file) => !file.isDirectory).firstWhere(
-              (file) => file.name == 'AndroidManifest.xml',
-              orElse: () =>
-                  throw Exception('APK ichida AndroidManifest.xml topilmadi'),
-            );
-
-    final manifestBytes = Uint8List.fromList(manifest.content);
-
-    return _parseBinaryXml(manifestBytes);
-  }
 
   List<String> _parseBinaryXml(Uint8List bytes) {
     if (bytes.length < 8) {
@@ -298,21 +290,26 @@ class _LengthInfo {
   final int bytesUsed;
 }
 
-Map<String, Object?> _analyzePermissionPayload(Uint8List apkBytes) {
+/// Top-level function for [compute] — extracts and analyzes AndroidManifest.xml.
+Map<String, Object?> _analyzePermissionPayloadFromPath(String filePath) {
+  final manifestBytes = readManifestBytesFromApk(filePath);
   final analyzer = PermissionAnalyzer();
-  final result = analyzer._analyzeBytes(apkBytes);
+  return _resultToPayload(analyzer._analyzeManifestBytes(manifestBytes));
+}
 
+Map<String, Object?> _resultToPayload(PermissionResult result) {
   return <String, Object?>{
     'allPermissions': result.allPermissions,
-    'dangerousPermissions': result.dangerousPermissions
-        .map(
-          (permission) => <String, Object?>{
-            'name': permission.name,
-            'score': permission.score,
-            'reason': permission.reason,
-          },
-        )
-        .toList(),
+    'dangerousPermissions':
+        result.dangerousPermissions
+            .map(
+              (permission) => <String, Object?>{
+                'name': permission.name,
+                'score': permission.score,
+                'reason': permission.reason,
+              },
+            )
+            .toList(),
     'detectedCombos': result.detectedCombos,
     'permissionScore': result.permissionScore,
   };

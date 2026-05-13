@@ -28,7 +28,9 @@ class AppScanService {
     required VirusTotalService virusTotalService,
     required NativePackageService nativePackageService,
     ApkScanEngine? apkScanEngine,
+    Set<String> userWhitelist = const {},
   })  : _nativePackageService = nativePackageService,
+        _userWhitelist = userWhitelist,
         _apkScanEngine = apkScanEngine ??
             ApkScanEngine(
               permissionAnalyzer: PermissionAnalyzer(),
@@ -37,6 +39,7 @@ class AppScanService {
 
   final NativePackageService _nativePackageService;
   final ApkScanEngine _apkScanEngine;
+  final Set<String> _userWhitelist;
   static const Set<String> _trustedPackageNames = {
     'com.example.posbon_app',
     'com.google.android.apps.meetings',
@@ -104,37 +107,47 @@ class AppScanService {
   };
 
   Future<List<ProtectedApp>> loadInstalledApps() async {
+    // includeIcons: false — icons are large (50-150 KB each as bytes) and would
+    // allocate 150-300 MB for 100 apps. Load them lazily in the UI instead.
     final apps = await FlutterDeviceApps.listApps(
-      includeIcons: true,
+      includeIcons: false,
       includeSystem: false,
       onlyLaunchable: true,
     );
 
-    final results = await Future.wait(
-      apps.map((app) async {
-        final installerStore = await FlutterDeviceApps.getInstallerStore(
-          app.packageName ?? '',
-        );
-        return _applyTrustOverride(
-          ProtectedApp(
-            packageName: app.packageName ?? '',
-            name: app.appName ?? app.packageName ?? 'Noma\'lum ilova',
-            version: app.versionName ?? 'unknown',
-            iconBytes: app.iconBytes,
-            icon: Icons.android_rounded,
-            risk: _sourceRisk(installerStore),
-            riskScore: _sourceScore(installerStore),
-            source: _sourceLabel(installerStore),
-            installedDate: _formatDate(app.firstInstallTime),
-            lastUpdatedDate: _formatDate(app.lastUpdateTime),
-            permissions: const [],
-            virusTotalDetections: 0,
-            virusTotalTotalEngines: 0,
-            installerStore: installerStore,
-          ),
-        );
-      }),
-    );
+    // Process in batches of 8 — all 100 getInstallerStore() calls in parallel
+    // floods the Android Platform thread's message queue, causing visible lag.
+    const batchSize = 8;
+    final results = <ProtectedApp>[];
+    for (var i = 0; i < apps.length; i += batchSize) {
+      final batch = apps.skip(i).take(batchSize);
+      final batchResults = await Future.wait(
+        batch.map((app) async {
+          final installerStore = await FlutterDeviceApps.getInstallerStore(
+            app.packageName ?? '',
+          );
+          return _applyTrustOverride(
+            ProtectedApp(
+              packageName: app.packageName ?? '',
+              name: app.appName ?? app.packageName ?? 'Noma\'lum ilova',
+              version: app.versionName ?? 'unknown',
+              iconBytes: null,
+              icon: Icons.android_rounded,
+              risk: _sourceRisk(installerStore),
+              riskScore: _sourceScore(installerStore),
+              source: _sourceLabel(installerStore),
+              installedDate: _formatDate(app.firstInstallTime),
+              lastUpdatedDate: _formatDate(app.lastUpdateTime),
+              permissions: const [],
+              virusTotalDetections: 0,
+              virusTotalTotalEngines: 0,
+              installerStore: installerStore,
+            ),
+          );
+        }),
+      );
+      results.addAll(batchResults);
+    }
 
     results.sort((a, b) => b.riskScore.compareTo(a.riskScore));
     return results;
@@ -368,7 +381,8 @@ class AppScanService {
 
     final normalizedName = _normalizeAppName(app.name);
     final isTrusted = _trustedPackageNames.contains(app.packageName) ||
-        _trustedAppNames.contains(normalizedName);
+        _trustedAppNames.contains(normalizedName) ||
+        _userWhitelist.contains(app.packageName);
     if (!isTrusted) {
       return app.copyWith(isTrusted: false);
     }

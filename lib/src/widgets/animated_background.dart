@@ -101,6 +101,9 @@ class _AuroraPainter extends CustomPainter {
     final a1 = slow * 2 * math.pi;
     final a2 = fast * 2 * math.pi;
 
+    // Blur radii tuned down (was 140-160). The orbs already overlap heavily,
+    // so a smaller blur kernel preserves the soft aurora look but costs a
+    // fraction of GPU time per frame on Android (Gaussian blur scales ~O(r²)).
     drawOrb(
       center: Offset(
         w * (0.25 + 0.12 * math.cos(a1)),
@@ -108,7 +111,7 @@ class _AuroraPainter extends CustomPainter {
       ),
       radius: w * 0.45,
       color: AppColors.accent.withValues(alpha: 0.12 * intensity),
-      blur: 140,
+      blur: 70,
     );
     drawOrb(
       center: Offset(
@@ -117,7 +120,7 @@ class _AuroraPainter extends CustomPainter {
       ),
       radius: w * 0.38,
       color: const Color(0xFF3FB59A).withValues(alpha: 0.10 * intensity),
-      blur: 130,
+      blur: 65,
     );
     drawOrb(
       center: Offset(
@@ -126,10 +129,12 @@ class _AuroraPainter extends CustomPainter {
       ),
       radius: w * 0.55,
       color: const Color(0xFF0E3C34).withValues(alpha: 0.40 * intensity),
-      blur: 160,
+      blur: 80,
     );
 
-    for (var i = 0; i < 18; i++) {
+    // Sparse particle layer kept short (was 18) — barely visible above the
+    // blurred orbs but each tiny circle still costs a paint command.
+    for (var i = 0; i < 8; i++) {
       final seed = i * 12.9898;
       final x = ((math.sin(seed) + 1) / 2) * w;
       final baseY = ((math.cos(seed * 1.7) + 1) / 2) * h;

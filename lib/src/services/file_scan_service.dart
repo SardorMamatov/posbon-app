@@ -90,7 +90,14 @@ class PosbonScanService {
 
   Stream<ScanProgressUpdate> get updates => _updatesController.stream;
 
-  static const Set<String> _scanExtensions = {'.apk'};
+  static const Set<String> _scanExtensions = {
+    '.apk',
+    '.xapk',
+    '.zip',
+    '.pdf',
+    '.exe',
+    '.dex',
+  };
 
   Future<List<File>> collectDownloadFiles() async {
     final info = await _nativePackageService.getDeviceInfo();
@@ -104,50 +111,28 @@ class PosbonScanService {
     };
 
     final matchedFiles = <File>[];
+    final seenPaths = <String>{};
     for (final path in candidates) {
       final directory = Directory(path);
       if (!await directory.exists()) continue;
       try {
-        matchedFiles.addAll(
-          directory
-              .listSync(recursive: true)
-              .whereType<File>()
-              .where(
-                (file) => _scanExtensions.contains(_extensionOf(file.path)),
-              )
-              .where(_fileExists),
-        );
+        // Non-recursive listing — Download folders are flat in practice and
+        // recursive walks can take seconds on real devices with many files.
+        for (final entity in directory.listSync(followLinks: false)) {
+          if (entity is! File) continue;
+          if (!_scanExtensions.contains(_extensionOf(entity.path))) continue;
+          if (!seenPaths.add(entity.path)) continue;
+          if (_fileExists(entity)) matchedFiles.add(entity);
+        }
       } on FileSystemException {
         continue;
       }
     }
 
-    if (matchedFiles.isNotEmpty) {
-      return matchedFiles.toSet().toList()
-        ..sort((a, b) => _safeLastModified(b).compareTo(_safeLastModified(a)));
-    }
-
-    final fallbackRoot = Directory('/storage/emulated/0/');
-    if (!await fallbackRoot.exists()) {
-      return [];
-    }
-
-    try {
-      return fallbackRoot
-          .listSync(recursive: true)
-          .whereType<File>()
-          .where(
-            (file) =>
-                file.path.toLowerCase().contains('download') &&
-                _scanExtensions.contains(_extensionOf(file.path)),
-          )
-          .where(_fileExists)
-          .toSet()
-          .toList()
-        ..sort((a, b) => _safeLastModified(b).compareTo(_safeLastModified(a)));
-    } on FileSystemException {
-      return [];
-    }
+    matchedFiles.sort(
+      (a, b) => _safeLastModified(b).compareTo(_safeLastModified(a)),
+    );
+    return matchedFiles;
   }
 
   Future<List<File>> pickFiles() async {
@@ -199,6 +184,17 @@ class PosbonScanService {
       return _apkScanEngine.scanApk(filePath: path);
     }
     throw Exception('Hozircha faqat APK fayllar tezkor tekshiriladi.');
+  }
+
+  /// Fast local-only scan: parses just the AndroidManifest.xml inside the APK
+  /// (no full APK read, no SHA256, no VirusTotal). Suitable for live monitoring
+  /// and the new-APK alert flow where latency matters.
+  Future<ApkScanResult> scanSingleFileLocally(String path) async {
+    final extension = _extensionOf(path);
+    if (extension != '.apk') {
+      throw Exception('Hozircha faqat APK fayllar tezkor tekshiriladi.');
+    }
+    return _apkScanEngine.scanApkLocally(filePath: path);
   }
 
   Future<ApkScanResult> scanSingleFileDeep(String path) async {
