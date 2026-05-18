@@ -247,25 +247,27 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
   }
 
   Future<void> _bootstrap() async {
-    // Phase 1: load settings then permissions. Both are wrapped with try/catch
-    // + timeout so that a hanging MethodChannel call (common on MIUI/EMUI) or
-    // a Keystore init failure never leaves the user stuck on the splash screen.
-    try {
-      await _settings.load().timeout(const Duration(seconds: 6));
-    } catch (_) {
-      // Settings failed or timed out — proceed with defaults (no agreement,
-      // no live monitoring). The user will see the agreement screen.
-    }
-
-    try {
-      _permissions = await _permissionsService
-          .loadStatuses(_tr)
-          .timeout(const Duration(seconds: 8));
-    } catch (_) {
-      // Permission checks failed or timed out — use empty list so the app
-      // routes to the permissions screen where the user can grant them.
-      _permissions = [];
-    }
+    // Phase 1: load settings and permissions in parallel. Both are wrapped with
+    // try/catch + timeout so that a hanging MethodChannel call (common on
+    // MIUI/EMUI) or a Keystore init failure never leaves the user stuck on the
+    // splash screen. Running them concurrently cuts the worst-case blocking
+    // time from 14 s (6 + 8) down to ~8 s.
+    List<PermissionStatusCard> permResult = [];
+    await Future.wait<void>([
+      () async {
+        try {
+          await _settings.load().timeout(const Duration(seconds: 6));
+        } catch (_) {}
+      }(),
+      () async {
+        try {
+          permResult = await _permissionsService
+              .loadStatuses(_tr)
+              .timeout(const Duration(seconds: 8));
+        } catch (_) {}
+      }(),
+    ]);
+    _permissions = permResult;
 
     if (!mounted) return;
 
@@ -280,10 +282,22 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
     }
 
     setState(() {
-      _stage = next;
+      // Agreement and permissions are mandatory gates — always enforce them.
+      // Don't override a scan that was already started by an incoming file
+      // intent (stream listener fires before this callback runs).
+      if (next == AppStage.agreement || next == AppStage.permissions) {
+        _stage = next;
+      } else if (_stage == AppStage.splash) {
+        _stage = next;
+      }
+      // If _stage is scanning/results, the incoming-file flow controls navigation.
     });
 
-    // Phase 2: heavy data loading in background — independent loads run in
+    // Phase 2a: restore any pending open-file intent FIRST so the scanning
+    // screen appears without waiting for the heavy data loads below.
+    unawaited(_restorePendingOpenFile());
+
+    // Phase 2b: heavy data loading in background — independent loads run in
     // parallel so the dashboard reaches a usable state sooner.
     unawaited(() async {
       await Future.wait<void>([
@@ -305,17 +319,17 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
       if (_settings.liveMonitoring) {
         _startDownloadWatcher();
       }
-      await _restorePendingOpenFile();
     }());
   }
 
   Future<void> _loadHistory() async {
     final findings = await _historyService.load();
     if (!mounted) {
-      _history = findings;
+      // Don't overwrite findings that a concurrent scan already placed in memory.
+      if (!_scanInProgress) _history = findings;
       return;
     }
-    setState(() => _history = findings);
+    if (!_scanInProgress) setState(() => _history = findings);
   }
 
   Future<void> _loadSystemIntegrity() async {
@@ -396,39 +410,6 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
   Future<String> _sha256Of(String path) async {
     final bytes = await File(path).readAsBytes();
     return sha256.convert(bytes).toString();
-  }
-
-  /// Runs VT + FileScan.io in background after local result is already shown.
-  /// Updates history and sends notification only if threat level increased.
-  Future<void> _runDeepScanBackground(
-    String path,
-    ScanFinding localFinding,
-  ) async {
-    try {
-      final deepResult = await _fileScanService.scanSingleFileDeep(path);
-      final deepFinding = _fileScanService.findingFromResult(deepResult);
-      if (!mounted) return;
-      // Only update if deep scan found something the local scan missed.
-      final wasRisky = localFinding.risk.isRisky;
-      final isRisky = deepFinding.risk.isRisky;
-      setState(() {
-        _history = [
-          deepFinding,
-          ..._history.where((item) => item.location != deepFinding.location),
-        ];
-      });
-      if (isRisky && !wasRisky && _hasNotificationPermission) {
-        await _nativePackageService.showNotification(
-          title:
-              deepFinding.risk.isDangerous
-                  ? _tr.t('scan.found_dangerous')
-                  : _tr.t('scan.found_suspicious'),
-          body: deepFinding.name,
-        );
-      }
-    } catch (_) {
-      // Background scan failure is silent — local result remains.
-    }
   }
 
   Future<void> _notifyIfNeeded(List<ScanFinding> findings) async {
@@ -515,6 +496,16 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
 
   bool get _hasFileManagerPermission =>
       _isPermissionGranted(PermissionCardId.fileManager);
+
+  Map<String, ScanFinding> get _fileFindingsMap {
+    final map = <String, ScanFinding>{};
+    for (final f in _history) {
+      if (f.type == ScanTargetType.file && f.location != null) {
+        map[f.location!] = f;
+      }
+    }
+    return map;
+  }
 
   bool get _hasNotificationPermission =>
       _isPermissionGranted(PermissionCardId.notifications);
@@ -878,7 +869,15 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
       return;
     }
 
-    await _scanFiles(files);
+    final alreadyScanned = _fileFindingsMap;
+    final newFiles =
+        files.where((f) => !alreadyScanned.containsKey(f.path)).toList();
+    if (newFiles.isEmpty) {
+      _showMessage(_tr.t('files.all_scanned'));
+      return;
+    }
+
+    await _scanFiles(newFiles);
   }
 
   Future<void> _scanFiles(List<File> files) async {
@@ -930,6 +929,14 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
   }
 
   Future<void> _scanSingleDownloadFile(File file) async {
+    final cached = _fileFindingsMap[file.path];
+    if (cached != null) {
+      setState(() {
+        _tab = DashboardTab.history;
+        _stage = AppStage.results;
+      });
+      return;
+    }
     await _scanIncomingFile(file.path);
   }
 
@@ -1034,12 +1041,13 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
 
   Future<void> _scanIncomingFile(String path) async {
     if (_scanInProgress) {
+      // Joriy skan tugaguncha faylni saqlayapmiz — yo'qolmaydi.
+      _pendingIncomingFilePath = path;
       _showMessage(_tr.t('files.prev_in_progress'));
       return;
     }
     _pendingIncomingFilePath = null;
     final fileName = path.split(RegExp(r'[\\/]')).last;
-    final isApk = fileName.toLowerCase().endsWith('.apk');
 
     _startScanSession();
     if (mounted) {
@@ -1052,18 +1060,20 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
     }
 
     try {
-      // Phase 1: fast local scan (permission analysis for APK, instant for others).
-      final localResult =
-          isApk
-              ? await _fileScanService.scanSingleFileLocally(path)
-              : await _fileScanService.scanSingleFileDeep(path);
-      final localFinding = _fileScanService.findingFromResult(localResult);
+      // Full scan: permission analysis + VirusTotal in parallel.
+      // Keep the scanning animation until the cloud result arrives — the user
+      // can press "Move to background" if they don't want to wait.
+      final result = await _fileScanService.scanSingleFileDeep(path);
+      final finding = _fileScanService.findingFromResult(result);
       if (!mounted) return;
+      final newHistory = [
+        finding,
+        ..._history.where((item) => item.location != finding.location),
+      ];
+      // Save immediately so a concurrent _loadHistory() reload won't wipe it.
+      unawaited(_historyService.save(newHistory));
       setState(() {
-        _history = [
-          localFinding,
-          ..._history.where((item) => item.location != localFinding.location),
-        ];
+        _history = newHistory;
         _scannedCount = 1;
         if (_scanBackgroundMode) {
           _pendingResultsNavigation = true;
@@ -1072,14 +1082,8 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
           _stage = AppStage.results;
         }
       });
-      await _notifyIfNeeded([localFinding]);
+      await _notifyIfNeeded([finding]);
       _stopScanSession();
-
-      // Phase 2: deep cloud scan in the background for APKs only.
-      if (isApk) {
-        unawaited(_runDeepScanBackground(path, localFinding));
-      }
-
       await _loadFiles(force: true, silent: true, seedKnownPaths: true);
     } on vt.VirusTotalRateLimitException catch (error) {
       _scanStartedAt = null;
@@ -1089,7 +1093,8 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
       if (mounted) {
         setState(() => _stage = AppStage.files);
       }
-    } catch (error) {
+    } catch (error, stack) {
+      debugPrint('[IncomingFileScan] Xato | $path\n$error\n$stack');
       _scanStartedAt = null;
       _scanInProgress = false;
       _scanBackgroundMode = false;
@@ -1101,6 +1106,86 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
         setState(() => _stage = AppStage.files);
       }
     }
+  }
+
+  Future<void> _deleteAllRiskyFindings(BuildContext ctx) async {
+    final risky =
+        _history
+            .where(
+              (f) =>
+                  f.risk.isRisky &&
+                  f.type == ScanTargetType.file &&
+                  f.location != null &&
+                  f.location!.isNotEmpty,
+            )
+            .toList();
+    if (risky.isEmpty) return;
+
+    final tr = _tr;
+    final confirmed = await showDialog<bool>(
+      context: ctx,
+      builder:
+          (_) => AlertDialog(
+            backgroundColor: AppColors.secondarySurface,
+            title: Text(
+              formatTemplate(tr.t('results.delete_all_risky'), {
+                'n': risky.length,
+              }),
+            ),
+            content: Text(
+              formatTemplate(tr.t('results.delete_all_confirm'), {
+                'n': risky.length,
+              }),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(ctx).pop(false),
+                child: Text(tr.t('common.cancel')),
+              ),
+              TextButton(
+                onPressed: () => Navigator.of(ctx).pop(true),
+                child: Text(
+                  tr.t('results.delete_file'),
+                  style: const TextStyle(color: AppColors.danger),
+                ),
+              ),
+            ],
+          ),
+    );
+    if (confirmed != true || !mounted) return;
+
+    final deletedLocations = <String>{};
+    for (final finding in risky) {
+      final location = finding.location!;
+      try {
+        final file = File(location);
+        if (await file.exists()) {
+          await file.delete();
+        }
+        deletedLocations.add(location);
+      } catch (_) {
+        deletedLocations.add(location);
+      }
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _history =
+          _history
+              .where((f) => !deletedLocations.contains(f.location))
+              .toList();
+      _downloadFiles =
+          _downloadFiles
+              .where((f) => !deletedLocations.contains(f.path))
+              .toList();
+      _knownDownloadPaths.removeAll(deletedLocations);
+    });
+    unawaited(_historyService.save(_history));
+    _showMessage(
+      formatTemplate(tr.t('results.delete_all_done'), {
+        'n': deletedLocations.length,
+      }),
+    );
   }
 
   Future<void> _deleteFindingFile(ScanFinding finding) async {
@@ -1129,6 +1214,36 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
         _knownDownloadPaths.remove(location);
       });
       _showMessage(_tr.t('files.delete_done'));
+    } catch (error) {
+      _showMessage(
+        formatTemplate(_tr.t('files.delete_failed'), {'e': error}),
+        isError: true,
+      );
+    }
+  }
+
+  Future<void> _deleteDownloadFile(File file) async {
+    if (!await file.exists()) {
+      setState(() {
+        _downloadFiles =
+            _downloadFiles.where((f) => f.path != file.path).toList();
+        _knownDownloadPaths.remove(file.path);
+      });
+      _showMessage(_tr.t('files.deleted'));
+      return;
+    }
+    try {
+      await file.delete();
+      if (!mounted) return;
+      setState(() {
+        _history =
+            _history.where((item) => item.location != file.path).toList();
+        _downloadFiles =
+            _downloadFiles.where((f) => f.path != file.path).toList();
+        _knownDownloadPaths.remove(file.path);
+      });
+      await _historyService.save(_history);
+      _showMessage(_tr.t('files.deleted'));
     } catch (error) {
       _showMessage(
         formatTemplate(_tr.t('files.delete_failed'), {'e': error}),
@@ -1476,8 +1591,10 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
           onScanAll: _scanAllDownloadFiles,
           onPickFiles: _pickAndScanFiles,
           onOpenFile: _scanSingleDownloadFile,
+          onDeleteFile: _deleteDownloadFile,
           onOpenPermissions:
               () => _togglePermission(PermissionCardId.fileManager),
+          fileFindingsMap: _fileFindingsMap,
           onSelectTab: (tab) {
             _openTab(tab);
           },
@@ -1498,6 +1615,7 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
           findings: _history,
           initialFilter: _resultsFilter,
           onDeleteFinding: _deleteFindingFile,
+          onDeleteAllRisky: _deleteAllRiskyFindings,
           onSelectTab: (tab) {
             _openTab(tab);
           },
@@ -1541,18 +1659,22 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
         );
         break;
       case AppStage.settings:
-        screen = Scaffold(
-          backgroundColor: Colors.transparent,
-          body: SettingsScreen(
-            controller: _settings,
-            onChanged: () {
-              if (mounted) setState(() {});
-            },
-            appVersion: kPosbonAppVersion,
-          ),
-          bottomNavigationBar: PosbonBottomNav(
-            currentTab: DashboardTab.settings,
-            onSelected: _openTab,
+        screen = AnimatedAuroraBackground(
+          intensity: 0.6,
+          child: Scaffold(
+            backgroundColor: Colors.transparent,
+            extendBody: true,
+            body: SettingsScreen(
+              controller: _settings,
+              onChanged: () {
+                if (mounted) setState(() {});
+              },
+              appVersion: kPosbonAppVersion,
+            ),
+            bottomNavigationBar: PosbonBottomNav(
+              currentTab: DashboardTab.settings,
+              onSelected: _openTab,
+            ),
           ),
         );
         break;
@@ -1945,9 +2067,10 @@ class HomeDashboardScreen extends StatelessWidget {
     return AnimatedAuroraBackground(
       child: Scaffold(
         backgroundColor: Colors.transparent,
+        extendBody: true,
         body: SafeArea(
           child: OverflowSafeScrollView(
-            padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+            padding: const EdgeInsets.fromLTRB(20, 16, 20, 112),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -1979,6 +2102,7 @@ class HomeDashboardScreen extends StatelessWidget {
                         ],
                       ),
                     ),
+
                     _GlassIconButton(
                       icon: Icons.info_outline_rounded,
                       onTap: onOpenAbout,
@@ -2357,7 +2481,7 @@ class ScanningScreen extends StatelessWidget {
               ClipRRect(
                 borderRadius: BorderRadius.circular(99),
                 child: LinearProgressIndicator(
-                  value: progress.clamp(0, 1),
+                  value: progress > 0 ? progress.clamp(0, 1) : null,
                   minHeight: 10,
                   color: AppColors.accent,
                   backgroundColor: AppColors.mutedSurface,
@@ -2421,7 +2545,9 @@ class FilesScreen extends StatelessWidget {
     required this.onScanAll,
     required this.onPickFiles,
     required this.onOpenFile,
+    required this.onDeleteFile,
     required this.onOpenPermissions,
+    required this.fileFindingsMap,
     required this.onSelectTab,
     required this.currentTab,
     super.key,
@@ -2434,14 +2560,17 @@ class FilesScreen extends StatelessWidget {
   final Future<void> Function() onScanAll;
   final Future<void> Function() onPickFiles;
   final Future<void> Function(File file) onOpenFile;
+  final Future<void> Function(File file) onDeleteFile;
   final VoidCallback onOpenPermissions;
+  final Map<String, ScanFinding> fileFindingsMap;
   final ValueChanged<DashboardTab> onSelectTab;
   final DashboardTab currentTab;
-
+  
   @override
   Widget build(BuildContext context) {
     final tr = context.tr;
     return Scaffold(
+      extendBody: true,
       body: SafeArea(
         child: Padding(
           padding: const EdgeInsets.all(24),
@@ -2496,6 +2625,7 @@ class FilesScreen extends StatelessWidget {
                             ),
                           ),
                         ),
+                        
                         if (!hasFilePermission)
                           TextButton(
                             onPressed: onOpenPermissions,
@@ -2543,18 +2673,29 @@ class FilesScreen extends StatelessWidget {
                           child:
                               files.isEmpty
                                   ? ListView(
+                                    padding: const EdgeInsets.only(bottom: 88),
                                     children: const [
                                       SizedBox(height: 56),
                                       EmptyFilesState(),
                                     ],
                                   )
                                   : ListView.builder(
+                                    padding: const EdgeInsets.only(bottom: 88),
                                     itemCount: files.length,
                                     itemBuilder: (context, index) {
                                       final file = files[index];
+                                      final cached =
+                                          fileFindingsMap[file.path];
                                       return DownloadFileTile(
                                         file: file,
-                                        onTap: () => onOpenFile(file),
+                                        cachedFinding: cached,
+                                        onTap: () => _showFileDetailSheet(
+                                          context,
+                                          file: file,
+                                          cachedFinding: cached,
+                                          onScan: () => onOpenFile(file),
+                                          onDelete: () => onDeleteFile(file),
+                                        ),
                                       );
                                     },
                                   ),
@@ -2576,6 +2717,7 @@ class ResultsScreen extends StatefulWidget {
   const ResultsScreen({
     required this.findings,
     required this.onDeleteFinding,
+    required this.onDeleteAllRisky,
     required this.onSelectTab,
     required this.currentTab,
     this.initialFilter = RiskFilter.all,
@@ -2584,6 +2726,7 @@ class ResultsScreen extends StatefulWidget {
 
   final List<ScanFinding> findings;
   final Future<void> Function(ScanFinding finding) onDeleteFinding;
+  final Future<void> Function(BuildContext ctx) onDeleteAllRisky;
   final ValueChanged<DashboardTab> onSelectTab;
   final DashboardTab currentTab;
   final RiskFilter initialFilter;
@@ -2630,6 +2773,7 @@ class _ResultsScreenState extends State<ResultsScreen> {
     return AnimatedAuroraBackground(
       child: Scaffold(
         backgroundColor: Colors.transparent,
+        extendBody: true,
         body: SafeArea(
           child: Padding(
             padding: const EdgeInsets.fromLTRB(20, 18, 20, 0),
@@ -2704,12 +2848,53 @@ class _ResultsScreenState extends State<ResultsScreen> {
                   ],
                 ),
                 const SizedBox(height: 16),
+                Builder(
+                  builder: (ctx) {
+                    final riskyCount =
+                        widget.findings
+                            .where(
+                              (f) =>
+                                  f.risk.isRisky &&
+                                  f.type == ScanTargetType.file,
+                            )
+                            .length;
+                    if (riskyCount < 2) return const SizedBox.shrink();
+                    final tr = ctx.tr;
+                    return Padding(
+                      padding: const EdgeInsets.only(bottom: 12),
+                      child: SizedBox(
+                        width: double.infinity,
+                        child: OutlinedButton.icon(
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: AppColors.danger,
+                            side: const BorderSide(color: AppColors.danger),
+                            padding: const EdgeInsets.symmetric(vertical: 12),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(14),
+                            ),
+                          ),
+                          icon: const Icon(
+                            Icons.delete_sweep_rounded,
+                            size: 20,
+                          ),
+                          label: Text(
+                            formatTemplate(tr.t('results.delete_all_risky'), {
+                              'n': riskyCount,
+                            }),
+                            style: const TextStyle(fontWeight: FontWeight.w600),
+                          ),
+                          onPressed: () => widget.onDeleteAllRisky(ctx),
+                        ),
+                      ),
+                    );
+                  },
+                ),
                 Expanded(
                   child:
                       filtered.isEmpty
                           ? const EmptySafeState()
                           : ListView.builder(
-                            padding: const EdgeInsets.only(bottom: 16),
+                            padding: const EdgeInsets.only(bottom: 88),
                             itemCount: filtered.length,
                             itemBuilder: (context, index) {
                               final finding = filtered[index];
@@ -2849,6 +3034,7 @@ class _InstalledAppsScreenState extends State<InstalledAppsScreen> {
     };
 
     return Scaffold(
+      extendBody: true,
       body: SafeArea(
         child: Padding(
           padding: const EdgeInsets.all(24),
@@ -2932,6 +3118,7 @@ class _InstalledAppsScreenState extends State<InstalledAppsScreen> {
                             key: const PageStorageKey<String>(
                               'installed_apps_list',
                             ),
+                            padding: const EdgeInsets.only(bottom: 88),
                             itemCount: filteredApps.length,
                             itemBuilder: (context, index) {
                               final app = filteredApps[index];
@@ -2997,7 +3184,7 @@ class _AppDetailScreenState extends State<AppDetailScreen> {
         _showAllPermissions || app.permissions.length <= 4
             ? app.permissions
             : app.permissions.take(4).toList();
-
+  
     return Scaffold(
       body: SafeArea(
         child: SingleChildScrollView(
@@ -4710,7 +4897,7 @@ class PosbonBottomNav extends StatelessWidget {
     return SafeArea(
       top: false,
       child: Padding(
-        padding: const EdgeInsets.fromLTRB(18, 0, 18, 10),
+        padding: const EdgeInsets.fromLTRB(18, 10, 18, 10),
         child: ClipRRect(
           borderRadius: BorderRadius.circular(28),
           child: Container(
@@ -5730,10 +5917,16 @@ class EmptyFilesState extends StatelessWidget {
 }
 
 class DownloadFileTile extends StatelessWidget {
-  const DownloadFileTile({required this.file, required this.onTap, super.key});
+  const DownloadFileTile({
+    required this.file,
+    required this.onTap,
+    this.cachedFinding,
+    super.key,
+  });
 
   final File file;
   final VoidCallback onTap;
+  final ScanFinding? cachedFinding;
 
   @override
   Widget build(BuildContext context) {
@@ -5810,6 +6003,14 @@ class DownloadFileTile extends StatelessWidget {
               ),
             ),
             const SizedBox(width: 10),
+            if (cachedFinding != null) ...[
+              Icon(
+                Icons.shield_rounded,
+                color: cachedFinding!.risk.color,
+                size: 20,
+              ),
+              const SizedBox(width: 6),
+            ],
             Icon(
               exists ? Icons.chevron_right_rounded : Icons.info_outline_rounded,
               color: exists ? AppColors.description : AppColors.warning,
@@ -6509,16 +6710,49 @@ class EmptySafeState extends StatelessWidget {
   }
 }
 
-class AppListTile extends StatelessWidget {
+class AppListTile extends StatefulWidget {
   const AppListTile({required this.app, required this.onTap, super.key});
 
   final ProtectedApp app;
   final VoidCallback onTap;
 
   @override
+  State<AppListTile> createState() => _AppListTileState();
+}
+
+class _AppListTileState extends State<AppListTile> {
+  static final Map<String, Uint8List?> _iconCache = {};
+  Uint8List? _iconBytes;
+
+  @override
+  void initState() {
+    super.initState();
+    final pkg = widget.app.packageName;
+    if (_iconCache.containsKey(pkg)) {
+      _iconBytes = _iconCache[pkg];
+    } else {
+      _loadIcon(pkg);
+    }
+  }
+
+  Future<void> _loadIcon(String packageName) async {
+    try {
+      final info = await FlutterDeviceApps.getApp(
+        packageName,
+        includeIcon: true,
+      );
+      final bytes = info?.iconBytes;
+      _iconCache[packageName] = bytes;
+      if (mounted) setState(() => _iconBytes = bytes);
+    } catch (_) {
+      _iconCache[packageName] = null;
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
     return InkWell(
-      onTap: onTap,
+      onTap: widget.onTap,
       borderRadius: BorderRadius.circular(18),
       child: Container(
         margin: const EdgeInsets.only(bottom: 12),
@@ -6539,12 +6773,12 @@ class AppListTile extends StatelessWidget {
                 border: Border.all(color: AppColors.outline),
               ),
               child:
-                  app.iconBytes != null
+                  _iconBytes != null
                       ? ClipOval(
-                        child: Image.memory(app.iconBytes!, fit: BoxFit.cover),
+                        child: Image.memory(_iconBytes!, fit: BoxFit.cover),
                       )
                       : Icon(
-                        app.icon ?? Icons.android_rounded,
+                        widget.app.icon ?? Icons.android_rounded,
                         color: AppColors.accent,
                       ),
             ),
@@ -6554,7 +6788,7 @@ class AppListTile extends StatelessWidget {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    app.name,
+                    widget.app.name,
                     style: const TextStyle(
                       fontSize: 16,
                       fontWeight: FontWeight.w700,
@@ -6562,7 +6796,7 @@ class AppListTile extends StatelessWidget {
                   ),
                   const SizedBox(height: 6),
                   Text(
-                    app.version,
+                    widget.app.version,
                     style: const TextStyle(
                       color: AppColors.description,
                       fontSize: 13,
@@ -6571,7 +6805,7 @@ class AppListTile extends StatelessWidget {
                 ],
               ),
             ),
-            RiskBadge(level: app.risk),
+            RiskBadge(level: widget.app.risk),
           ],
         ),
       ),
@@ -6699,6 +6933,243 @@ String _formatFileSize(int bytes) {
   if (kb < 1024) return '${kb.toStringAsFixed(1)} KB';
   final mb = kb / 1024;
   return '${mb.toStringAsFixed(1)} MB';
+}
+
+void _showFileDetailSheet(
+  BuildContext context, {
+  required File file,
+  required ScanFinding? cachedFinding,
+  required VoidCallback onScan,
+  required VoidCallback onDelete,
+}) {
+  final exists = _fileExists(file);
+  final fileSize = exists ? _tryFileLength(file) : null;
+  final lastModified = exists ? _tryLastModified(file) : null;
+
+  showModalBottomSheet<void>(
+    context: context,
+    backgroundColor: AppColors.secondarySurface,
+    isScrollControlled: true,
+    shape: const RoundedRectangleBorder(
+      borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+    ),
+    builder: (sheetCtx) {
+      final tr = sheetCtx.tr;
+      final fileName = file.uri.pathSegments.last;
+      final sizeLabel =
+          !exists
+              ? tr.t('files.moved')
+              : fileSize == null
+              ? tr.t('files.size_unknown')
+              : _formatFileSize(fileSize);
+      final dateLabel =
+          lastModified != null
+              ? _formatShortDate(lastModified)
+              : '—';
+
+      return SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(20, 14, 20, 24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Center(
+                child: Container(
+                  width: 44,
+                  height: 4,
+                  decoration: BoxDecoration(
+                    color: AppColors.description.withValues(alpha: 0.35),
+                    borderRadius: BorderRadius.circular(99),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 18),
+              Row(
+                children: [
+                  Container(
+                    width: 48,
+                    height: 48,
+                    decoration: BoxDecoration(
+                      color: Colors.black,
+                      borderRadius: BorderRadius.circular(14),
+                      border: Border.all(color: AppColors.outline),
+                    ),
+                    child: const Icon(
+                      Icons.android_rounded,
+                      color: AppColors.accent,
+                    ),
+                  ),
+                  const SizedBox(width: 14),
+                  Expanded(
+                    child: Text(
+                      fileName,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 17,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 18),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  color: AppColors.surface,
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(color: AppColors.outline),
+                ),
+                child: Column(
+                  children: [
+                    _InfoRow(
+                      label: tr.t('files.info_size'),
+                      value: sizeLabel,
+                    ),
+                    const SizedBox(height: 8),
+                    _InfoRow(
+                      label: tr.t('files.info_date'),
+                      value: dateLabel,
+                    ),
+                    const SizedBox(height: 8),
+                    _InfoRow(
+                      label: tr.t('files.info_status'),
+                      value:
+                          cachedFinding != null
+                              ? tr.t('files.status_scanned')
+                              : tr.t('files.status_not_scanned'),
+                      valueColor:
+                          cachedFinding != null
+                              ? cachedFinding.risk.color
+                              : AppColors.description,
+                    ),
+                    if (cachedFinding != null) ...[
+                      const SizedBox(height: 8),
+                      _InfoRow(
+                        label: tr.t('app_detail.risk_level'),
+                        value: cachedFinding.risk.label,
+                        valueColor: cachedFinding.risk.color,
+                      ),
+                    ],
+                    const SizedBox(height: 8),
+                    _InfoRow(
+                      label: tr.t('files.info_path'),
+                      value: file.path,
+                      small: true,
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 16),
+              Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: () {
+                        Navigator.of(sheetCtx).pop();
+                        onDelete();
+                      },
+                      icon: const Icon(
+                        Icons.delete_outline_rounded,
+                        size: 18,
+                      ),
+                      label: Text(tr.t('files.delete')),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: AppColors.danger,
+                        side: const BorderSide(color: AppColors.danger),
+                        padding: const EdgeInsets.symmetric(vertical: 14),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: ElevatedButton.icon(
+                      onPressed:
+                          exists
+                              ? () {
+                                Navigator.of(sheetCtx).pop();
+                                onScan();
+                              }
+                              : null,
+                      icon: const Icon(
+                        Icons.shield_rounded,
+                        size: 18,
+                      ),
+                      label: Text(
+                        cachedFinding != null
+                            ? tr.t('files.rescan')
+                            : tr.t('files.scan'),
+                      ),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: AppColors.accent,
+                        foregroundColor: Colors.black,
+                        disabledBackgroundColor:
+                            AppColors.surface,
+                        padding: const EdgeInsets.symmetric(vertical: 14),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      );
+    },
+  );
+}
+
+class _InfoRow extends StatelessWidget {
+  const _InfoRow({
+    required this.label,
+    required this.value,
+    this.valueColor,
+    this.small = false,
+  });
+
+  final String label;
+  final String value;
+  final Color? valueColor;
+  final bool small;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SizedBox(
+          width: 72,
+          child: Text(
+            label,
+            style: const TextStyle(
+              color: AppColors.description,
+              fontSize: 12,
+            ),
+          ),
+        ),
+        Expanded(
+          child: Text(
+            value,
+            style: TextStyle(
+              fontSize: small ? 11 : 13,
+              fontWeight: FontWeight.w600,
+              color: valueColor,
+              height: 1.4,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
 }
 
 class RiskBadge extends StatelessWidget {

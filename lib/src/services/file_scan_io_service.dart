@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:crypto/crypto.dart';
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
 
 class FileScanIoResult {
   const FileScanIoResult({
@@ -39,15 +40,31 @@ class FileScanIoResult {
 
 class FileScanIoService {
   FileScanIoService({required this.apiKey, Dio? dio})
-    : _dio =
-          dio ??
-          Dio(
-            BaseOptions(
-              baseUrl: 'https://www.filescan.io',
-              connectTimeout: const Duration(seconds: 30),
-              receiveTimeout: const Duration(seconds: 30),
-            ),
-          );
+    : _dio = dio ?? _buildDio();
+
+  static Dio _buildDio() {
+    final dio = Dio(
+      BaseOptions(
+        baseUrl: 'https://www.filescan.io',
+        connectTimeout: const Duration(seconds: 30),
+        receiveTimeout: const Duration(seconds: 30),
+        sendTimeout: const Duration(minutes: 2),
+      ),
+    );
+    if (kDebugMode) {
+      dio.interceptors.add(
+        LogInterceptor(
+          requestHeader: true,
+          requestBody: true,
+          responseBody: true,
+          responseHeader: false,
+          error: true,
+          logPrint: (o) => debugPrint('[FileScanIo] $o'),
+        ),
+      );
+    }
+    return dio;
+  }
 
   final String apiKey;
   final Dio _dio;

@@ -4,7 +4,6 @@ import 'package:flutter/services.dart';
 import '../core/app_locale.dart';
 import '../core/app_theme.dart';
 import '../core/settings_controller.dart';
-import '../widgets/animated_background.dart';
 
 class SettingsScreen extends StatelessWidget {
   const SettingsScreen({
@@ -22,14 +21,12 @@ class SettingsScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     final tr = context.tr;
 
-    return AnimatedAuroraBackground(
-      intensity: 0.6,
-      child: Scaffold(
-        backgroundColor: Colors.transparent,
-        body: SafeArea(
+    return Scaffold(
+      backgroundColor: Colors.transparent,
+      body: SafeArea(
           child: SingleChildScrollView(
             physics: const BouncingScrollPhysics(),
-            padding: const EdgeInsets.fromLTRB(20, 14, 20, 32),
+            padding: const EdgeInsets.fromLTRB(20, 14, 20, 120),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.center,
               children: [
@@ -105,7 +102,6 @@ class SettingsScreen extends StatelessWidget {
             ),
           ),
         ),
-      ),
     );
   }
 

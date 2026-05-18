@@ -78,8 +78,13 @@ class PermissionAnalyzer {
       throw Exception('APK topilmadi: $filePath');
     }
 
-    final payload = await compute(_analyzePermissionPayloadFromPath, filePath);
-    return _permissionResultFromPayload(payload);
+    try {
+      final payload = await compute(_analyzePermissionPayloadFromPath, filePath);
+      return _permissionResultFromPayload(payload);
+    } catch (e, st) {
+      debugPrint('[PermAnalyzer] analyze() xato | fayl: $filePath\n$e\n$st');
+      rethrow;
+    }
   }
 
   PermissionResult _permissionResultFromPayload(Map<String, Object?> payload) {

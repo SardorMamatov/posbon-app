@@ -316,7 +316,7 @@ class MainActivity : FlutterFragmentActivity() {
 
             inputStream.use { input ->
                 FileOutputStream(targetFile).use { output ->
-                    input.copyTo(output)
+                    input.copyTo(output, bufferSize = 65_536)
                 }
             }
 

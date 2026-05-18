@@ -427,7 +427,7 @@ class DownloadWatcherService : Service() {
         private const val EVENTS =
             FileObserver.CLOSE_WRITE or FileObserver.MOVED_TO or FileObserver.CREATE
 
-        val WATCHED_EXTENSIONS = setOf(".apk", ".zip", ".pdf", ".exe", ".dex", ".xapk")
+        val WATCHED_EXTENSIONS = setOf(".apk", ".xapk", ".zip", ".dex", ".jar")
 
         fun start(context: Context) {
             val intent = Intent(context, DownloadWatcherService::class.java)

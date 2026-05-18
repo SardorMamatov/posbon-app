@@ -101,45 +101,117 @@ class PosbonScanService {
     '.apk',
     '.xapk',
     '.zip',
-    '.pdf',
-    '.exe',
     '.dex',
+    '.jar',
   };
 
   Future<List<File>> collectDownloadFiles() async {
-    final info = await _nativePackageService.getDeviceInfo();
-    final candidates = <String>{
-      if (info.downloadsPath != null && info.downloadsPath!.isNotEmpty)
-        info.downloadsPath!,
+    final matchedFiles = <File>[];
+    final seenPaths = <String>{};
+
+    // Bosqich 1: Downloads papkasini skanerlash.
+    // Native path Android'dan olinadi — hardcoded pathlar fallback sifatida.
+    final nativePath = await _nativePackageService
+        .getDeviceInfo()
+        .then((info) => info.downloadsPath)
+        .catchError((_) => null as String?);
+
+    final downloadPaths = <String>{
+      if (nativePath != null && nativePath.isNotEmpty) nativePath,
       '/storage/emulated/0/Download',
       '/storage/emulated/0/Downloads',
       '/sdcard/Download',
       '/sdcard/Downloads',
     };
 
-    final matchedFiles = <File>[];
-    final seenPaths = <String>{};
-    for (final path in candidates) {
-      final directory = Directory(path);
-      if (!await directory.exists()) continue;
+    for (final path in downloadPaths) {
+      final dir = Directory(path);
+      bool exists = false;
       try {
-        // Non-recursive listing — Download folders are flat in practice and
-        // recursive walks can take seconds on real devices with many files.
-        for (final entity in directory.listSync(followLinks: false)) {
+        exists = await dir.exists();
+      } on FileSystemException catch (e) {
+        debugPrint('[FileScan] exists() xatolik: $path | $e');
+        continue;
+      }
+      if (!exists) continue;
+      try {
+        await for (final entity in dir.list(followLinks: false)) {
           if (entity is! File) continue;
           if (!_scanExtensions.contains(_extensionOf(entity.path))) continue;
           if (!seenPaths.add(entity.path)) continue;
-          if (_fileExists(entity)) matchedFiles.add(entity);
+          matchedFiles.add(entity);
         }
-      } on FileSystemException {
+      } on FileSystemException catch (e) {
+        debugPrint('[FileScan] list() xatolik: $path | $e');
         continue;
       }
     }
+
+    debugPrint(
+      '[FileScan] Bosqich 1 yakunlandi: ${matchedFiles.length} ta fayl topildi',
+    );
+
+    // Bosqich 2: MANAGE_EXTERNAL_STORAGE berilgan bo'lsa butun telefonni skanerlash.
+    // recursive: true ishlatilmaydi — /Android/data kabi cheklangan papkalar
+    // stream-level exception beradi va butun iterationni to'xtatadi.
+    // O'rniga: har bir papka uchun alohida try/catch bilan manual recursion.
+    final hasFullAccess = await Permission.manageExternalStorage.isGranted;
+    debugPrint('[FileScan] MANAGE_EXTERNAL_STORAGE: $hasFullAccess');
+    if (hasFullAccess) {
+      final root = Directory('/storage/emulated/0/');
+      if (await root.exists()) {
+        await _collectRecursive(
+          dir: root,
+          seenPaths: seenPaths,
+          matchedFiles: matchedFiles,
+        );
+      }
+    }
+
+    debugPrint('[FileScan] Jami topildi: ${matchedFiles.length} ta fayl');
 
     matchedFiles.sort(
       (a, b) => _safeLastModified(b).compareTo(_safeLastModified(a)),
     );
     return matchedFiles;
+  }
+
+  // Har bir papka uchun alohida exception handling bilan recursive scan.
+  // recursive: true ishlatilmaydi chunki cheklangan papka (masalan /Android/data)
+  // stream-level exception berib, butun iterationni to'xtatadi.
+  Future<void> _collectRecursive({
+    required Directory dir,
+    required Set<String> seenPaths,
+    required List<File> matchedFiles,
+  }) async {
+    List<FileSystemEntity> entries;
+    try {
+      entries = await dir.list(followLinks: false).toList();
+    } on FileSystemException {
+      return;
+    }
+
+    for (final entity in entries) {
+      final p = entity.path;
+      if (entity is File) {
+        if (!_scanExtensions.contains(_extensionOf(p))) continue;
+        if (!seenPaths.add(p)) continue;
+        matchedFiles.add(entity);
+      } else if (entity is Directory) {
+        // /Android/data va /Android/obb — cheklangan, o'tkazib yuboriladi.
+        if (p.endsWith('/Android/data') ||
+            p.endsWith('/Android/obb') ||
+            p.contains('/Android/data/') ||
+            p.contains('/Android/obb/')) {
+          continue;
+        }
+        await _collectRecursive(
+          dir: entity,
+          seenPaths: seenPaths,
+          matchedFiles: matchedFiles,
+        );
+      }
+    }
   }
 
   Future<List<File>> pickFiles() async {
@@ -175,14 +247,15 @@ class PosbonScanService {
       throw Exception('/storage/emulated/0/ katalogi topilmadi');
     }
 
-    final files =
-        root
-            .listSync(recursive: true)
-            .whereType<File>()
-            .where((file) => _scanExtensions.contains(_extensionOf(file.path)))
-            .toList();
+    final seenPaths = <String>{};
+    final rawFiles = <File>[];
+    await _collectRecursive(
+      dir: root,
+      seenPaths: seenPaths,
+      matchedFiles: rawFiles,
+    );
 
-    yield* _scanFiles(files);
+    yield* _scanFiles(rawFiles);
   }
 
   Future<ApkScanResult> scanSingleFile(String path) async {
@@ -250,7 +323,17 @@ class PosbonScanService {
       final extension = _extensionOf(file.path);
 
       if (extension == '.apk') {
-        final permissionResult = await _permissionAnalyzer.analyze(file.path);
+        PermissionResult permissionResult;
+        try {
+          permissionResult = await _permissionAnalyzer.analyze(file.path);
+        } catch (_) {
+          permissionResult = const PermissionResult(
+            allPermissions: [],
+            dangerousPermissions: [],
+            detectedCombos: [],
+            permissionScore: 0,
+          );
+        }
         _updatesController.add(
           ScanProgressUpdate(
             filePath: file.path,
@@ -354,14 +437,6 @@ class PosbonScanService {
     final dot = path.lastIndexOf('.');
     if (dot == -1) return '';
     return path.substring(dot).toLowerCase();
-  }
-
-  bool _fileExists(File file) {
-    try {
-      return file.existsSync();
-    } on FileSystemException {
-      return false;
-    }
   }
 
   DateTime _safeLastModified(File file) {

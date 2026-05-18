@@ -9,7 +9,12 @@ import 'package:archive/archive.dart';
 /// from stripping the dependency in permission_analyzer.dart.
 Uint8List readManifestBytesFromApk(String filePath) {
   final bytes = File(filePath).readAsBytesSync();
-  final archive = ZipDecoder().decodeBytes(bytes);
+  final Archive archive;
+  try {
+    archive = ZipDecoder().decodeBytes(bytes);
+  } catch (e) {
+    throw Exception('APK ZIP strukturasi noto\'g\'ri yoki buzilgan: $e');
+  }
   final entry = archive.findFile('AndroidManifest.xml');
   if (entry == null) {
     throw Exception('APK ichida AndroidManifest.xml topilmadi');

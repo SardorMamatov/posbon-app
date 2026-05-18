@@ -55,16 +55,32 @@ class VirusTotalRateLimitException implements Exception {
 }
 
 class VirusTotalService {
-  VirusTotalService({
-    required this.apiKey,
-    Dio? dio,
-  }) : _dio = dio ??
-            Dio(
-              BaseOptions(
-                baseUrl: 'https://www.virustotal.com/api/v3',
-                headers: <String, String>{'x-apikey': apiKey},
-              ),
-            );
+  VirusTotalService({required this.apiKey, Dio? dio})
+    : _dio = dio ?? _buildDio(apiKey);
+
+  static Dio _buildDio(String apiKey) {
+    final dio = Dio(
+      BaseOptions(
+        baseUrl: 'https://www.virustotal.com/api/v3',
+        headers: <String, String>{'x-apikey': apiKey},
+        connectTimeout: const Duration(seconds: 15),
+        receiveTimeout: const Duration(seconds: 30),
+      ),
+    );
+    if (kDebugMode) {
+      dio.interceptors.add(
+        LogInterceptor(
+          requestHeader: true,
+          requestBody: true,
+          responseBody: true,
+          responseHeader: false,
+          error: true,
+          logPrint: (o) => debugPrint('[VT] $o'),
+        ),
+      );
+    }
+    return dio;
+  }
 
   final String apiKey;
   final Dio _dio;
@@ -206,10 +222,7 @@ class VirusTotalService {
       );
     } on DioException catch (error) {
       if (error.response?.statusCode == 404) {
-        return const VirusTotalLookupResult(
-          found: false,
-          totalDetections: 0,
-        );
+        return const VirusTotalLookupResult(found: false, totalDetections: 0);
       }
       rethrow;
     }
@@ -255,12 +268,11 @@ class VirusTotalService {
         _lastRequestAt = DateTime.now();
         if (error.response?.statusCode == 429) {
           final retryHeader = error.response?.headers.value('Retry-After');
-          final retryAfterSeconds = int.tryParse(retryHeader ?? '') ??
+          final retryAfterSeconds =
+              int.tryParse(retryHeader ?? '') ??
               remainingWaitSeconds.clamp(1, requestInterval.inSeconds).toInt();
           queued.completer.completeError(
-            VirusTotalRateLimitException(
-              retryAfterSeconds: retryAfterSeconds,
-            ),
+            VirusTotalRateLimitException(retryAfterSeconds: retryAfterSeconds),
             stackTrace,
           );
           continue;
@@ -303,11 +315,12 @@ class VirusTotalService {
   }) {
     final data = payload['data'] as Map<String, dynamic>? ?? {};
     final attributes = data['attributes'] as Map<String, dynamic>? ?? {};
-    final stats = attributes['last_analysis_stats'] as Map<String, dynamic>? ??
+    final stats =
+        attributes['last_analysis_stats'] as Map<String, dynamic>? ??
         const <String, dynamic>{};
     final analysisResults =
         attributes['last_analysis_results'] as Map<String, dynamic>? ??
-            const <String, dynamic>{};
+        const <String, dynamic>{};
 
     final malicious = (stats['malicious'] as num?)?.toInt() ?? 0;
     final suspicious = (stats['suspicious'] as num?)?.toInt() ?? 0;
@@ -331,9 +344,11 @@ class VirusTotalService {
   VirusTotalResult _parseAnalysisResult(Map<String, dynamic> payload) {
     final data = payload['data'] as Map<String, dynamic>? ?? {};
     final attributes = data['attributes'] as Map<String, dynamic>? ?? {};
-    final stats = attributes['stats'] as Map<String, dynamic>? ??
+    final stats =
+        attributes['stats'] as Map<String, dynamic>? ??
         const <String, dynamic>{};
-    final results = attributes['results'] as Map<String, dynamic>? ??
+    final results =
+        attributes['results'] as Map<String, dynamic>? ??
         const <String, dynamic>{};
 
     final malicious = (stats['malicious'] as num?)?.toInt() ?? 0;
@@ -356,9 +371,10 @@ class VirusTotalService {
   }
 
   int _totalEngines(Map<String, dynamic> stats) {
-    return stats.values
-        .whereType<num>()
-        .fold<int>(0, (sum, value) => sum + value.toInt());
+    return stats.values.whereType<num>().fold<int>(
+      0,
+      (sum, value) => sum + value.toInt(),
+    );
   }
 
   String? _extractThreatLabel(Map<String, dynamic> results) {
@@ -377,8 +393,8 @@ class VirusTotalService {
     }
 
     if (labels.isEmpty) return null;
-    final sorted = labels.entries.toList()
-      ..sort((a, b) => b.value.compareTo(a.value));
+    final sorted =
+        labels.entries.toList()..sort((a, b) => b.value.compareTo(a.value));
     return sorted.first.key;
   }
 
@@ -403,10 +419,7 @@ class VirusTotalService {
 }
 
 class _QueuedRequest<T> {
-  const _QueuedRequest({
-    required this.request,
-    required this.completer,
-  });
+  const _QueuedRequest({required this.request, required this.completer});
 
   final Future<T> Function() request;
   final Completer<T> completer;

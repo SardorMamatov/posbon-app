@@ -1,5 +1,7 @@
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
+
 import 'package:crypto/crypto.dart';
 
 import '../models/security_models.dart';
@@ -41,9 +43,7 @@ class ApkScanResult {
           .take(2)
           .map((permission) => permission.reason)
           .join(', ');
-      parts.add(
-        '${dangerousPermissions.length} ta xavfli ruxsat: $topReasons',
-      );
+      parts.add('${dangerousPermissions.length} ta xavfli ruxsat: $topReasons');
     }
 
     if (permissionResult.detectedCombos.isNotEmpty) {
@@ -79,9 +79,9 @@ class ApkScanEngine {
     required PermissionAnalyzer permissionAnalyzer,
     required VirusTotalService virusTotalService,
     FileScanIoService? fileScanIoService,
-  })  : _permissionAnalyzer = permissionAnalyzer,
-        _virusTotalService = virusTotalService,
-        _fileScanIoService = fileScanIoService;
+  }) : _permissionAnalyzer = permissionAnalyzer,
+       _virusTotalService = virusTotalService,
+       _fileScanIoService = fileScanIoService;
 
   final PermissionAnalyzer _permissionAnalyzer;
   final VirusTotalService _virusTotalService;
@@ -100,24 +100,31 @@ class ApkScanEngine {
 
     final sha256Hash = await _sha256OfFile(filePath);
 
-    final futures = <Future<dynamic>>[
-      _permissionAnalyzer.analyze(filePath),
-      _virusTotalService.checkByHash(filePath),
-      if (_fileScanIoService != null)
-        _fileScanIoService.scanFile(filePath)
-      else
-        Future.value(null),
-    ];
+    // APK: permission tahlili + VirusTotal. FileScan.io ishlatilmaydi —
+    // VT APK ma'lumotlar bazasi ancha katta va aniqroq.
+    final permResultFuture = _permissionAnalyzer.analyze(filePath).onError<
+      Object
+    >((e, st) {
+      debugPrint(
+        '[ApkEngine] scanApk - manifest o\'qib bo\'lmadi, VT davom etadi | $filePath\n$e\n$st',
+      );
+      return const PermissionResult(
+        allPermissions: [],
+        dangerousPermissions: [],
+        detectedCombos: [],
+        permissionScore: 0,
+      );
+    });
 
-    final results = await Future.wait<dynamic>(futures);
+    final results = await Future.wait<dynamic>([
+      permResultFuture,
+      _virusTotalService.checkByHash(filePath),
+    ]);
 
     final permissionResult = results[0] as PermissionResult;
     final vtResult = results[1] as VirusTotalResult;
-    final fsioResult = results[2] as FileScanIoResult?;
 
-    var finalScore = permissionResult.permissionScore +
-        vtResult.vtScore +
-        (fsioResult?.fsioScore ?? 0);
+    var finalScore = permissionResult.permissionScore + vtResult.vtScore;
     finalScore += _installerBonus(installerPackage);
     finalScore = finalScore.clamp(0, 100);
 
@@ -125,15 +132,10 @@ class ApkScanEngine {
       filePath: filePath,
       fileName: file.uri.pathSegments.last,
       sha256Hash: sha256Hash,
-      riskLevel: _riskFromScore(
-        finalScore,
-        vtResult: vtResult,
-        fsioResult: fsioResult,
-      ),
+      riskLevel: _riskFromScore(finalScore, vtResult: vtResult),
       finalScore: finalScore,
       permissionResult: permissionResult,
       vtResult: vtResult,
-      fsioResult: fsioResult,
       installSource: _installerLabel(installerPackage),
       scannedAt: DateTime.now(),
     );
@@ -145,14 +147,26 @@ class ApkScanEngine {
       throw Exception('Fayl topilmadi: $filePath');
     }
 
+    // ZIP/DEX/JAR/XAPK: FileScan.io primary (dinamik tahlil).
+    // FileScan.io sozlanmagan bo'lsa, VT hash tekshiruvi fallback sifatida.
     final fsio = _fileScanIoService;
-    final results = await Future.wait<dynamic>([
-      _virusTotalService.checkByHash(filePath),
-      fsio != null ? fsio.scanFile(filePath) : Future.value(FileScanIoResult.empty),
-    ]);
 
-    final vtResult = results[0] as VirusTotalResult;
-    final fsioResult = results[1] as FileScanIoResult;
+    FileScanIoResult fsioResult;
+    VirusTotalResult vtResult;
+
+    if (fsio != null) {
+      fsioResult = await fsio.scanFile(filePath);
+      vtResult = const VirusTotalResult(
+        wasFound: false,
+        maliciousCount: 0,
+        suspiciousCount: 0,
+        totalEngines: 0,
+        vtScore: 0,
+      );
+    } else {
+      vtResult = await _virusTotalService.checkByHash(filePath);
+      fsioResult = FileScanIoResult.empty;
+    }
 
     final finalScore = (vtResult.vtScore + fsioResult.fsioScore).clamp(0, 100);
 
@@ -167,7 +181,11 @@ class ApkScanEngine {
       filePath: filePath,
       fileName: file.uri.pathSegments.last,
       sha256Hash: '',
-      riskLevel: _riskFromScore(finalScore, vtResult: vtResult, fsioResult: fsioResult),
+      riskLevel: _riskFromScore(
+        finalScore,
+        vtResult: vtResult,
+        fsioResult: fsioResult,
+      ),
       finalScore: finalScore,
       permissionResult: emptyPermissions,
       vtResult: vtResult,
@@ -187,41 +205,71 @@ class ApkScanEngine {
       throw Exception('APK topilmadi: $filePath');
     }
 
-    final permissionResult = await _permissionAnalyzer.analyze(filePath);
+    try {
+      final permissionResult = await _permissionAnalyzer.analyze(filePath);
 
-    var finalScore = permissionResult.permissionScore;
-    if (includeInstallerBonus) {
-      finalScore += _installerBonus(installerPackage);
-    }
-    finalScore = finalScore.clamp(0, 100);
+      var finalScore = permissionResult.permissionScore;
+      if (includeInstallerBonus) {
+        finalScore += _installerBonus(installerPackage);
+      }
+      finalScore = finalScore.clamp(0, 100);
 
-    return ApkScanResult(
-      filePath: filePath,
-      fileName: file.uri.pathSegments.last,
-      sha256Hash: '',
-      riskLevel: _riskFromScore(
-        finalScore,
+      return ApkScanResult(
+        filePath: filePath,
+        fileName: file.uri.pathSegments.last,
+        sha256Hash: '',
+        riskLevel: _riskFromScore(
+          finalScore,
+          vtResult: const VirusTotalResult(
+            wasFound: false,
+            maliciousCount: 0,
+            suspiciousCount: 0,
+            totalEngines: 0,
+            vtScore: 0,
+          ),
+        ),
+        finalScore: finalScore,
+        permissionResult: permissionResult,
         vtResult: const VirusTotalResult(
           wasFound: false,
           maliciousCount: 0,
           suspiciousCount: 0,
           totalEngines: 0,
+          note: 'Faqat lokal permission tahlili bajarildi.',
           vtScore: 0,
         ),
-      ),
-      finalScore: finalScore,
-      permissionResult: permissionResult,
-      vtResult: const VirusTotalResult(
-        wasFound: false,
-        maliciousCount: 0,
-        suspiciousCount: 0,
-        totalEngines: 0,
-        note: 'Faqat lokal permission tahlili bajarildi.',
-        vtScore: 0,
-      ),
-      installSource: _installerLabel(installerPackage),
-      scannedAt: DateTime.now(),
-    );
+        installSource: _installerLabel(installerPackage),
+        scannedAt: DateTime.now(),
+      );
+    } catch (e, st) {
+      debugPrint(
+        '[ApkEngine] scanApkLocally - manifest o\'qib bo\'lmadi | $filePath\n$e\n$st',
+      );
+      return ApkScanResult(
+        filePath: filePath,
+        fileName: file.uri.pathSegments.last,
+        sha256Hash: '',
+        riskLevel: RiskLevel.safe,
+        finalScore: 0,
+        permissionResult: const PermissionResult(
+          allPermissions: [],
+          dangerousPermissions: [],
+          detectedCombos: [],
+          permissionScore: 0,
+        ),
+        vtResult: const VirusTotalResult(
+          wasFound: false,
+          maliciousCount: 0,
+          suspiciousCount: 0,
+          totalEngines: 0,
+          note:
+              'Manifest o\'qib bo\'lmadi — APK noto\'g\'ri ZIP strukturasida.',
+          vtScore: 0,
+        ),
+        installSource: _installerLabel(installerPackage),
+        scannedAt: DateTime.now(),
+      );
+    }
   }
 
   Future<String> _sha256OfFile(String path) async {
@@ -277,3 +325,4 @@ class _DigestSink implements Sink<Digest> {
   @override
   void close() {}
 }
+
