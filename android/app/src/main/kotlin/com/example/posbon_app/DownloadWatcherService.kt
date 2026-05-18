@@ -9,12 +9,15 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.ServiceInfo
+import android.database.ContentObserver
+import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.os.FileObserver
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.provider.MediaStore
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
@@ -29,6 +32,7 @@ class DownloadWatcherService : Service() {
 
     private val watchedFolders = mutableListOf<File>()
     private val observers = mutableListOf<FileObserver>()
+    private var mediaStoreObserver: ContentObserver? = null
     private val seenApkPaths = mutableSetOf<String>()
     private val handler = Handler(Looper.getMainLooper())
     private val pendingFiles = mutableMapOf<String, Long>()
@@ -51,6 +55,9 @@ class DownloadWatcherService : Service() {
         if (observers.isEmpty()) {
             seedKnownPaths()
             startObservers()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startMediaStoreObserver()
+            }
         }
         return START_STICKY
     }
@@ -59,6 +66,8 @@ class DownloadWatcherService : Service() {
         observers.forEach { it.stopWatching() }
         observers.clear()
         watchedFolders.clear()
+        mediaStoreObserver?.let { contentResolver.unregisterContentObserver(it) }
+        mediaStoreObserver = null
         super.onDestroy()
     }
 
@@ -66,6 +75,8 @@ class DownloadWatcherService : Service() {
         observers.forEach { it.stopWatching() }
         observers.clear()
         watchedFolders.clear()
+        mediaStoreObserver?.let { contentResolver.unregisterContentObserver(it) }
+        mediaStoreObserver = null
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             stopForeground(STOP_FOREGROUND_REMOVE)
         } else {
@@ -141,6 +152,31 @@ class DownloadWatcherService : Service() {
             } catch (_: Exception) {
             }
         }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            seedFromMediaStore()
+        }
+    }
+
+    private fun seedFromMediaStore() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        val projection = arrayOf(MediaStore.Downloads.DATA)
+        try {
+            contentResolver.query(
+                MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                projection,
+                null,
+                null,
+                null,
+            )?.use { cursor ->
+                val dataCol = cursor.getColumnIndexOrThrow(MediaStore.Downloads.DATA)
+                while (cursor.moveToNext()) {
+                    val path = cursor.getString(dataCol) ?: continue
+                    if (isWatchedExtension(path)) seenApkPaths.add(path)
+                }
+            }
+        } catch (_: Exception) {
+        }
+        Log.d(TAG, "seedFromMediaStore tugadi | jami ko'rilgan: ${seenApkPaths.size} ta fayl")
     }
 
     private fun startObservers() {
@@ -170,6 +206,62 @@ class DownloadWatcherService : Service() {
         }
     }
 
+    private fun startMediaStoreObserver() {
+        val observer = object : ContentObserver(handler) {
+            override fun onChange(selfChange: Boolean, uri: Uri?) {
+                Log.d(TAG, "MediaStore.Downloads o'zgardi | uri: $uri")
+                checkMediaStoreForNewFiles()
+            }
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            contentResolver.registerContentObserver(
+                MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                true,
+                observer,
+            )
+        }
+        mediaStoreObserver = observer
+        Log.i(TAG, "ContentObserver boshlandi (Android 10+)")
+    }
+
+    private fun checkMediaStoreForNewFiles() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        val projection = arrayOf(
+            MediaStore.Downloads.DISPLAY_NAME,
+            MediaStore.Downloads.DATA,
+            MediaStore.Downloads.SIZE,
+        )
+        try {
+            contentResolver.query(
+                MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                projection,
+                null,
+                null,
+                "${MediaStore.Downloads.DATE_ADDED} DESC",
+            )?.use { cursor ->
+                val nameCol = cursor.getColumnIndexOrThrow(MediaStore.Downloads.DISPLAY_NAME)
+                val dataCol = cursor.getColumnIndexOrThrow(MediaStore.Downloads.DATA)
+                val sizeCol = cursor.getColumnIndexOrThrow(MediaStore.Downloads.SIZE)
+                while (cursor.moveToNext()) {
+                    val name = cursor.getString(nameCol) ?: continue
+                    val path = cursor.getString(dataCol) ?: continue
+                    val size = cursor.getLong(sizeCol)
+                    if (!isWatchedExtension(name)) continue
+                    if (seenApkPaths.contains(path)) continue
+                    if (size <= 0) continue
+                    Log.d(TAG, "MediaStore: yangi fayl topildi | $name | $path | $size bayt")
+                    val file = File(path)
+                    if (!file.exists() || !file.canRead()) continue
+                    val now = System.currentTimeMillis()
+                    pendingFiles[path] = now
+                    handler.postDelayed({ flushPending(path) }, debounceMs)
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "MediaStore so'rovida xato: ${e.message}")
+        }
+    }
+
     private fun handleEvent(event: Int, name: String?, parentPath: String) {
         if (name.isNullOrBlank()) return
         if (!isWatchedExtension(name)) return
@@ -184,7 +276,12 @@ class DownloadWatcherService : Service() {
         if (!interesting) return
 
         val fullPath = File(parentPath, name).absolutePath
-        if (seenApkPaths.contains(fullPath)) return
+        Log.d(TAG, "FileObserver hodisa ushlandi | fayl: $name | papka: $parentPath | event: $masked")
+
+        if (seenApkPaths.contains(fullPath)) {
+            Log.d(TAG, "Fayl allaqachon ko'rilgan, o'tkazib yuborildi: $fullPath")
+            return
+        }
 
         val now = System.currentTimeMillis()
         pendingFiles[fullPath] = now
@@ -198,13 +295,18 @@ class DownloadWatcherService : Service() {
         pendingFiles.remove(path)
 
         val file = File(path)
-        if (!file.exists() || !file.canRead() || file.length() <= 0) return
+        if (!file.exists() || !file.canRead() || file.length() <= 0) {
+            Log.w(TAG, "Fayl mavjud emas yoki o'qib bo'lmaydi: $path")
+            return
+        }
         if (!seenApkPaths.add(path)) return
 
+        Log.i(TAG, "Yangi fayl tasdiqlandi | yo'l: $path | hajm: ${file.length()} bayt | tur: ${file.extension}")
         notifyNewApk(file)
     }
 
     private fun notifyNewApk(file: File) {
+        Log.i(TAG, "Notification yuborilmoqda | fayl: ${file.name} | to'liq yo'l: ${file.absolutePath}")
         val launchIntent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
             putExtra(EXTRA_INCOMING_FILE_PATH, file.absolutePath)

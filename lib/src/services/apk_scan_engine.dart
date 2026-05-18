@@ -87,6 +87,8 @@ class ApkScanEngine {
   final VirusTotalService _virusTotalService;
   final FileScanIoService? _fileScanIoService;
 
+  void cancelFileScanIo() => _fileScanIoService?.cancel();
+
   Future<ApkScanResult> scanApk({
     required String filePath,
     String? installerPackage,
@@ -133,6 +135,44 @@ class ApkScanEngine {
       vtResult: vtResult,
       fsioResult: fsioResult,
       installSource: _installerLabel(installerPackage),
+      scannedAt: DateTime.now(),
+    );
+  }
+
+  Future<ApkScanResult> scanNonApkFile(String filePath) async {
+    final file = File(filePath);
+    if (!await file.exists()) {
+      throw Exception('Fayl topilmadi: $filePath');
+    }
+
+    final fsio = _fileScanIoService;
+    final results = await Future.wait<dynamic>([
+      _virusTotalService.checkByHash(filePath),
+      fsio != null ? fsio.scanFile(filePath) : Future.value(FileScanIoResult.empty),
+    ]);
+
+    final vtResult = results[0] as VirusTotalResult;
+    final fsioResult = results[1] as FileScanIoResult;
+
+    final finalScore = (vtResult.vtScore + fsioResult.fsioScore).clamp(0, 100);
+
+    const emptyPermissions = PermissionResult(
+      allPermissions: [],
+      dangerousPermissions: [],
+      detectedCombos: [],
+      permissionScore: 0,
+    );
+
+    return ApkScanResult(
+      filePath: filePath,
+      fileName: file.uri.pathSegments.last,
+      sha256Hash: '',
+      riskLevel: _riskFromScore(finalScore, vtResult: vtResult, fsioResult: fsioResult),
+      finalScore: finalScore,
+      permissionResult: emptyPermissions,
+      vtResult: vtResult,
+      fsioResult: fsioResult,
+      installSource: 'Fayl',
       scannedAt: DateTime.now(),
     );
   }

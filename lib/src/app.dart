@@ -17,9 +17,11 @@ import 'models/posbon_safe_models.dart';
 import 'models/security_models.dart';
 import 'screens/agreement_screen.dart';
 import 'screens/settings_screen.dart';
+import 'services/apk_scan_engine.dart';
 import 'services/app_scan_service.dart';
 import 'services/file_scan_io_service.dart';
 import 'services/file_scan_service.dart';
+import 'services/permission_analyzer.dart';
 import 'services/history_service.dart';
 import 'services/native_package_service.dart';
 import 'services/posbon_safe_service.dart';
@@ -175,6 +177,11 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
     _fileScanService = FileScanService(
       virusTotalService: _virusTotalService,
       nativePackageService: _nativePackageService,
+      apkScanEngine: ApkScanEngine(
+        permissionAnalyzer: PermissionAnalyzer(),
+        virusTotalService: _virusTotalService,
+        fileScanIoService: _fileScanIoService,
+      ),
     );
     _permissionsService = PermissionsService(
       nativePackageService: _nativePackageService,
@@ -832,6 +839,7 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
   }
 
   void _cancelScan() {
+    _fileScanService.cancelCurrentScan();
     _scanStartedAt = null;
     _scanInProgress = false;
     _scanBackgroundMode = false;
@@ -1442,6 +1450,7 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
             _openTab(tab);
           },
           onOpenResultsFiltered: _openResultsFiltered,
+          onCancelScan: _cancelScan,
           currentTab: _tab,
         );
         break;
@@ -1573,6 +1582,7 @@ class _PosbonRootState extends State<PosbonRoot> with WidgetsBindingObserver {
             _openTab(tab);
           },
           onOpenResultsFiltered: _openResultsFiltered,
+          onCancelScan: _cancelScan,
           currentTab: _tab,
         );
         break;
@@ -1904,6 +1914,7 @@ class HomeDashboardScreen extends StatelessWidget {
     required this.scanTotalCount,
     required this.currentScanTarget,
     required this.liveMonitoring,
+    required this.onCancelScan,
     super.key,
   });
 
@@ -1922,6 +1933,7 @@ class HomeDashboardScreen extends StatelessWidget {
   final int scanTotalCount;
   final String currentScanTarget;
   final bool liveMonitoring;
+  final VoidCallback onCancelScan;
 
   @override
   Widget build(BuildContext context) {
@@ -1982,6 +1994,7 @@ class HomeDashboardScreen extends StatelessWidget {
                       totalCount: scanTotalCount,
                       currentTarget: currentScanTarget,
                       background: scanBackgroundMode,
+                      onCancel: onCancelScan,
                     ),
                   ),
                 _HomeHeroCard(
@@ -2141,12 +2154,14 @@ class _ScanningBanner extends StatelessWidget {
     required this.totalCount,
     required this.currentTarget,
     required this.background,
+    required this.onCancel,
   });
 
   final int scannedCount;
   final int totalCount;
   final String currentTarget;
   final bool background;
+  final VoidCallback onCancel;
 
   @override
   Widget build(BuildContext context) {
@@ -2215,6 +2230,41 @@ class _ScanningBanner extends StatelessWidget {
               minHeight: 5,
               color: AppColors.accent,
               backgroundColor: AppColors.mutedSurface,
+            ),
+          ),
+          const SizedBox(height: 10),
+          Align(
+            alignment: Alignment.centerRight,
+            child: GestureDetector(
+              onTap: onCancel,
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 5,
+                ),
+                decoration: BoxDecoration(
+                  color: Colors.redAccent.withValues(alpha: 0.15),
+                  borderRadius: BorderRadius.circular(99),
+                  border: Border.all(
+                    color: Colors.redAccent.withValues(alpha: 0.5),
+                  ),
+                ),
+                child: const Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.stop_rounded, size: 14, color: Colors.redAccent),
+                    SizedBox(width: 4),
+                    Text(
+                      "To'xtatish",
+                      style: TextStyle(
+                        color: Colors.redAccent,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
             ),
           ),
         ],

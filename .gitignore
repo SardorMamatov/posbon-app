@@ -51,3 +51,4 @@ build/
 .idea/
 .vscode/
 *.iml
+lib/src/core/app_constants.dart

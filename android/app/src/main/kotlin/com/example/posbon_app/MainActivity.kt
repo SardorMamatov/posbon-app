@@ -18,6 +18,7 @@ import androidx.biometric.BiometricPrompt
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
+import android.util.Log
 import io.flutter.embedding.android.FlutterFragmentActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -26,6 +27,7 @@ import java.io.FileOutputStream
 
 class MainActivity : FlutterFragmentActivity() {
     private val channelName = "uz.posbon/native_packages"
+    private val TAG = "PosbonMain"
     private val notificationChannelId = "posbon_scan_results"
     private var pendingOpenFilePath: String? = null
     private var pendingDestination: String? = null
@@ -254,6 +256,7 @@ class MainActivity : FlutterFragmentActivity() {
 
     private fun dispatchIncomingFileIfPossible() {
         val path = pendingOpenFilePath ?: return
+        Log.i(TAG, "Flutter ga fayl yo'li yuborildi: $path")
         methodChannel?.invokeMethod(
             "incomingFileReady",
             mapOf("path" to path),
@@ -270,6 +273,7 @@ class MainActivity : FlutterFragmentActivity() {
 
     private fun resolveIncomingFile(intent: Intent?): String? {
         if (intent == null) return null
+        Log.d(TAG, "resolveIncomingFile | action: ${intent.action} | extras: ${intent.extras?.keySet()?.joinToString()}")
 
         intent.getStringExtra(DownloadWatcherService.EXTRA_INCOMING_FILE_PATH)
             ?.takeIf { it.isNotBlank() }

@@ -39,7 +39,8 @@ class FileScanIoResult {
 
 class FileScanIoService {
   FileScanIoService({required this.apiKey, Dio? dio})
-    : _dio = dio ??
+    : _dio =
+          dio ??
           Dio(
             BaseOptions(
               baseUrl: 'https://www.filescan.io',
@@ -50,26 +51,32 @@ class FileScanIoService {
 
   final String apiKey;
   final Dio _dio;
+  CancelToken _cancelToken = CancelToken();
 
-  static const int _maxPollAttempts = 8;
-  // Progressively longer delays: 3s, 5s, 8s, then 10s for remaining attempts.
+  void cancel() {
+    _cancelToken.cancel('Foydalanuvchi tomonidan bekor qilindi');
+    _cancelToken = CancelToken();
+  }
+
+  static const int _maxPollAttempts = 12;
+  // Progressively longer delays: 5s, 8s, 12s, then 15s for remaining attempts.
   static const List<Duration> _pollDelays = [
-    Duration(seconds: 3),
     Duration(seconds: 5),
     Duration(seconds: 8),
-    Duration(seconds: 10),
+    Duration(seconds: 12),
+    Duration(seconds: 15),
   ];
 
   Map<String, String> get _headers =>
       apiKey.isNotEmpty ? {'X-Api-Key': apiKey} : {};
 
-  /// Hash orqali tezkor tekshiruv — fayl yuklanmaydi.
   Future<FileScanIoResult?> checkReputation(String sha256) async {
     try {
       final response = await _dio.get<Map<String, dynamic>>(
         '/api/reputation/hash',
         queryParameters: {'sha256': sha256},
         options: Options(headers: _headers),
+        cancelToken: _cancelToken,
       );
       final data = response.data;
       if (data == null) return null;
@@ -108,13 +115,13 @@ class FileScanIoService {
         filePath,
         filename: file.uri.pathSegments.last,
       ),
-      'rapid_mode': 'true',
     });
 
     final response = await _dio.post<Map<String, dynamic>>(
       '/api/scan/file',
       data: formData,
       options: Options(headers: _headers),
+      cancelToken: _cancelToken,
     );
 
     final flowId = response.data?['flow_id']?.toString();
@@ -127,32 +134,48 @@ class FileScanIoService {
   /// flow_id bo'yicha natijani kutib oladi (polling).
   Future<FileScanIoResult> pollReport(String flowId) async {
     for (var attempt = 0; attempt < _maxPollAttempts; attempt++) {
-      final delay = attempt < _pollDelays.length
-          ? _pollDelays[attempt]
-          : _pollDelays.last;
+      final delay =
+          attempt < _pollDelays.length
+              ? _pollDelays[attempt]
+              : _pollDelays.last;
       await Future<void>.delayed(delay);
 
       try {
         final response = await _dio.get<Map<String, dynamic>>(
           '/api/scan/$flowId/report',
-          queryParameters: {'filter': 'general,allSignalGroups'},
+          queryParameters: {'filter': 'general,finalVerdict,allSignalGroups'},
           options: Options(headers: _headers),
+          cancelToken: _cancelToken,
         );
 
         final data = response.data;
         if (data == null) continue;
 
-        final verdictBlock =
-            data['finalVerdict'] as Map<String, dynamic>? ?? {};
-        final verdict = verdictBlock['verdict']?.toString() ?? '';
+        // finalVerdict may be top-level or nested inside reports[uuid]
+        Map<String, dynamic>? verdictBlock =
+            data['finalVerdict'] as Map<String, dynamic>?;
 
+        Map<String, dynamic>? reportEntry;
+        if (verdictBlock == null) {
+          final reports = data['reports'] as Map<String, dynamic>? ?? {};
+          for (final r in reports.values) {
+            if (r is Map<String, dynamic> && r.isNotEmpty) {
+              reportEntry = r;
+              verdictBlock = r['finalVerdict'] as Map<String, dynamic>?;
+              if (verdictBlock != null) break;
+            }
+          }
+        }
+
+        final verdict = verdictBlock?['verdict']?.toString() ?? '';
         if (verdict.isEmpty) continue;
 
         final threatLevel =
-            (verdictBlock['threatLevel'] as num?)?.toDouble() ?? 0.0;
+            (verdictBlock?['threatLevel'] as num?)?.toDouble() ?? 0.0;
 
-        final iocs = _extractIocs(data);
-        final malwareName = _extractMalwareName(data);
+        final effectiveData = reportEntry ?? data;
+        final iocs = _extractIocs(effectiveData);
+        final malwareName = _extractMalwareName(effectiveData);
         final score = _scoreFromVerdict(verdict, threatLevel);
 
         return FileScanIoResult(
@@ -185,7 +208,6 @@ class FileScanIoService {
       if (!await file.exists()) return FileScanIoResult.empty;
 
       final sha256Hash = await _sha256Of(filePath);
-
       final reputation = await checkReputation(sha256Hash);
       if (reputation != null) return reputation;
 
@@ -204,9 +226,7 @@ class FileScanIoService {
 
   Future<String> _sha256Of(String path) async {
     Digest? result;
-    final sink = sha256.startChunkedConversion(
-      _DigestSink((d) => result = d),
-    );
+    final sink = sha256.startChunkedConversion(_DigestSink((d) => result = d));
     await for (final chunk in File(path).openRead()) {
       sink.add(chunk);
     }
@@ -225,9 +245,10 @@ class FileScanIoService {
 
   String? _noteFromVerdict(String verdict, String? malwareName) {
     return switch (verdict) {
-      'MALICIOUS' => malwareName != null
-          ? 'FileScan.io "$malwareName" zararli dasturini aniqladi'
-          : 'FileScan.io faylni zararli deb baholadi',
+      'MALICIOUS' =>
+        malwareName != null
+            ? 'FileScan.io "$malwareName" zararli dasturini aniqladi'
+            : 'FileScan.io faylni zararli deb baholadi',
       'NO_THREAT' => 'FileScan.io xavf topilmadi',
       'BENIGN' => 'FileScan.io faylni xavfsiz deb baholadi',
       _ => null,
@@ -236,18 +257,17 @@ class FileScanIoService {
 
   String? _topDetection(Map<String, dynamic> detections) {
     if (detections.isEmpty) return null;
-    final labels = detections.values
-        .whereType<String>()
-        .where((v) => v.isNotEmpty)
-        .toList();
+    final labels =
+        detections.values
+            .whereType<String>()
+            .where((v) => v.isNotEmpty)
+            .toList();
     if (labels.isEmpty) return null;
     final freq = <String, int>{};
     for (final l in labels) {
       freq[l] = (freq[l] ?? 0) + 1;
     }
-    return (freq.entries.toList()..sort((a, b) => b.value - a.value))
-        .first
-        .key;
+    return (freq.entries.toList()..sort((a, b) => b.value - a.value)).first.key;
   }
 
   List<String> _extractIocs(Map<String, dynamic> data) {
@@ -270,12 +290,11 @@ class FileScanIoService {
     final reports = data['reports'] as Map<String, dynamic>? ?? {};
     for (final report in reports.values) {
       if (report is! Map<String, dynamic>) continue;
-      final signals =
-          report['allSignalGroups'] as Map<String, dynamic>? ?? {};
+      final signals = report['allSignalGroups'] as Map<String, dynamic>? ?? {};
       for (final group in signals.values) {
         if (group is! Map<String, dynamic>) continue;
-        final name = group['malwareName']?.toString() ??
-            group['name']?.toString();
+        final name =
+            group['malwareName']?.toString() ?? group['name']?.toString();
         if (name != null && name.isNotEmpty) return name;
       }
     }

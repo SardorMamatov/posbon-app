@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import '../core/app_locale.dart';
@@ -87,8 +88,14 @@ class PosbonScanService {
   final ApkScanEngine _apkScanEngine;
   final StreamController<ScanProgressUpdate> _updatesController =
       StreamController<ScanProgressUpdate>.broadcast();
+  bool _cancelRequested = false;
 
   Stream<ScanProgressUpdate> get updates => _updatesController.stream;
+
+  void cancelCurrentScan() {
+    _cancelRequested = true;
+    _apkScanEngine.cancelFileScanIo();
+  }
 
   static const Set<String> _scanExtensions = {
     '.apk',
@@ -183,7 +190,7 @@ class PosbonScanService {
     if (extension == '.apk') {
       return _apkScanEngine.scanApk(filePath: path);
     }
-    throw Exception('Hozircha faqat APK fayllar tezkor tekshiriladi.');
+    return _apkScanEngine.scanNonApkFile(path);
   }
 
   /// Fast local-only scan: parses just the AndroidManifest.xml inside the APK
@@ -191,16 +198,18 @@ class PosbonScanService {
   /// and the new-APK alert flow where latency matters.
   Future<ApkScanResult> scanSingleFileLocally(String path) async {
     final extension = _extensionOf(path);
+    debugPrint('[PosbonWatcher] Tezkor skan boshlandi | yo\'l: $path');
     if (extension != '.apk') {
-      throw Exception('Hozircha faqat APK fayllar tezkor tekshiriladi.');
+      return _apkScanEngine.scanNonApkFile(path);
     }
     return _apkScanEngine.scanApkLocally(filePath: path);
   }
 
   Future<ApkScanResult> scanSingleFileDeep(String path) async {
     final extension = _extensionOf(path);
+    debugPrint('[PosbonWatcher] Chuqur skan boshlandi | yo\'l: $path');
     if (extension != '.apk') {
-      throw Exception('Chuqur tekshiruv hozircha faqat APK uchun ishlaydi.');
+      return _apkScanEngine.scanNonApkFile(path);
     }
     return _apkScanEngine.scanApk(filePath: path);
   }
@@ -233,7 +242,9 @@ class PosbonScanService {
     final results = <ApkScanResult>[];
     var threats = 0;
 
+    _cancelRequested = false;
     for (var index = 0; index < safeFiles.length; index++) {
+      if (_cancelRequested) break;
       final file = safeFiles[index];
       final fileName = file.uri.pathSegments.last;
       final extension = _extensionOf(file.path);
